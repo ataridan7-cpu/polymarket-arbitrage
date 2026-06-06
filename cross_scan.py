@@ -334,6 +334,47 @@ async def main():
                         "vol24h": float(pm.get("volume24hr") or 0),
                     })
 
+            # Cross-platform bundle arb: buy YES on one side + NO on the other.
+            # One leg always pays $1 at resolution regardless of outcome.
+            km_yes_ask = float(km.get("yes_ask_dollars") or 0)
+            km_no_ask  = float(km.get("no_ask_dollars")  or 0)
+
+            # Case C: Buy Poly YES + Buy Kalshi NO → collect $1 either way
+            if ob["yes_ask"] and km_no_ask:
+                cost  = ob["yes_ask"] + km_no_ask
+                fees  = ob["yes_ask"] * POLY_FEE + km_no_ask * KALSHI_FEE
+                net   = 1.0 - cost - fees
+                if net >= MIN_EDGE:
+                    arbs.append({
+                        "type": "Bundle: Buy Poly YES + Kalshi NO",
+                        "net_edge": net,
+                        "gross_edge": 1.0 - cost,
+                        "buy_price": cost,
+                        "sell_price": 1.0,
+                        "poly_q": (pm.get("question") or "")[:80],
+                        "kalshi_t": (km.get("title") or "")[:80],
+                        "similarity": score,
+                        "vol24h": float(pm.get("volume24hr") or 0),
+                    })
+
+            # Case D: Buy Kalshi YES + Buy Poly NO → collect $1 either way
+            if km_yes_ask and ob["no_ask"]:
+                cost  = km_yes_ask + ob["no_ask"]
+                fees  = km_yes_ask * KALSHI_FEE + ob["no_ask"] * POLY_FEE
+                net   = 1.0 - cost - fees
+                if net >= MIN_EDGE:
+                    arbs.append({
+                        "type": "Bundle: Buy Kalshi YES + Poly NO",
+                        "net_edge": net,
+                        "gross_edge": 1.0 - cost,
+                        "buy_price": cost,
+                        "sell_price": 1.0,
+                        "poly_q": (pm.get("question") or "")[:80],
+                        "kalshi_t": (km.get("title") or "")[:80],
+                        "similarity": score,
+                        "vol24h": float(pm.get("volume24hr") or 0),
+                    })
+
             if (i + 1) % 10 == 0:
                 print(f"      {i+1}/{len(top_pairs)} checked  |  arb signals so far: {len(arbs)}", end="\r")
             await asyncio.sleep(0.05)
@@ -355,11 +396,16 @@ async def main():
     if genuine_arbs:
         genuine_arbs.sort(key=lambda x: -x["net_edge"])
         print("╔══════════════════════════════════════════════════════════════════════╗")
-        print("║  CROSS-PLATFORM ARB SIGNALS  (same category, same-direction price)  ║")
+        print("║  CROSS-PLATFORM ARB SIGNALS  (directional + bundle cross-platform)  ║")
         print("╚══════════════════════════════════════════════════════════════════════╝")
         for a in genuine_arbs[:10]:
+            is_bundle = a["type"].startswith("Bundle")
+            if is_bundle:
+                price_str = f"Total cost: ${a['buy_price']:.3f}  →  collect $1.00"
+            else:
+                price_str = f"Buy: ${a['buy_price']:.3f}   Sell: ${a['sell_price']:.3f}"
             print(f"  {a['type']}")
-            print(f"  Net edge: {a['net_edge']*100:+.2f}%   Buy: ${a['buy_price']:.3f}   Sell: ${a['sell_price']:.3f}")
+            print(f"  Net edge: {a['net_edge']*100:+.2f}%   {price_str}")
             print(f"  Match score: {a['similarity']:.2f}   Vol24h: ${a['vol24h']:,.0f}")
             print(f"  Poly:  {a['poly_q']}")
             print(f"  Kalshi:{a['kalshi_t']}")
