@@ -68,8 +68,8 @@ async def discover_kalshi_series(client) -> list[str]:
     (it returns the full ~10.7k set), so we filter client-side and cap the
     result to keep the markets fetch fast.
     """
-    series: list[str] = list(KALSHI_SERIES)
-    seen = set(series)
+    seen = set(KALSHI_SERIES)
+    discovered: list[str] = []
     try:
         r = await client.get(f"{KALSHI_URL}/series",
                              params={"status": "active"},
@@ -82,10 +82,13 @@ async def discover_kalshi_series(client) -> list[str]:
                 # Match against the same buckets the matcher uses downstream.
                 text = f"{ticker} {s.get('title') or ''}"
                 if category(text) != "other":
-                    series.append(ticker)
+                    discovered.append(ticker)
                     seen.add(ticker)
     except Exception:
         pass
+    # Sort discovered tickers deterministically so the cap is reproducible
+    # run-to-run (the API returns them in unstable order).
+    series = list(KALSHI_SERIES) + sorted(discovered)
     return series[:MAX_KALSHI_SERIES]
 
 
@@ -190,18 +193,72 @@ def kalshi_yes_mid(m):
     return ya or yb or None
 
 
-def normalize(text):
+_STOPWORDS = {"will","the","a","an","be","to","in","on","by","at","what","who","which","when",
+              "is","are","was","were","market","bet","odds","win","winner","prediction",
+              "of","for","and","or","than","that","this","it","as","with","from","after",
+              "before","above","below","over","under","reach","reaches","hit","hits","get",
+              "gets","any"}
+
+# Generic template words that appear in many same-category titles and carry no
+# discriminating power. Stripped before token-overlap scoring so the match is
+# driven by the *distinctive* tokens (names, thresholds), not the boilerplate.
+_BOILERPLATE = {"election","presidential","president","nomination","nominee","primary",
+                "republican","democratic","democrat","party","candidate","general","round",
+                "advance","race","seat","governor","mayoral","mayor","senate","senator",
+                "house","congress","congressional","vote","votes","second","first",
+                "interest","rate","rates","federal","funds","fed","meeting","fomc",
+                "year","years","month","price","value","level"}
+
+
+def _tokens(text):
     import re
     text = text.lower()
     text = re.sub(r'[^\w\s]', ' ', text)
-    stop = {"will","the","a","an","be","to","in","on","by","at","what","who","which","when",
-            "is","are","was","were","market","bet","odds","win","winner","prediction"}
-    return ' '.join(w for w in text.split() if w not in stop)
+    return [w for w in text.split() if w not in _STOPWORDS]
+
+
+def normalize(text):
+    return ' '.join(_tokens(text))
+
+
+def content_tokens(text):
+    """Distinctive tokens: drop stopwords AND generic template boilerplate."""
+    return {w for w in _tokens(text) if w not in _BOILERPLATE}
+
+
+def jaccard(t1, t2):
+    a, b = content_tokens(t1), content_tokens(t2)
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
 
 
 def similarity(t1, t2):
+    """Blend character-sequence ratio with content-token Jaccard.
+
+    SequenceMatcher alone scores on shared boilerplate (it rated
+    'Eric Trump … nomination' vs 'Trump family member … nominee' at 0.95).
+    Weighting toward token-set overlap rejects that while still rewarding
+    genuinely equivalent questions that share their distinctive words.
+    """
     n1, n2 = normalize(t1), normalize(t2)
-    return SequenceMatcher(None, n1, n2).ratio()
+    seq = SequenceMatcher(None, n1, n2).ratio()
+    jac = jaccard(t1, t2)
+    return 0.35 * seq + 0.65 * jac
+
+
+def discriminator_penalty(t1, t2):
+    """Penalise pairs whose distinctive tokens point at different subjects.
+
+    If each title contains a significant word the other lacks (e.g. a specific
+    candidate name like 'eric' vs 'family'/'member'), they are not the same
+    market even when the surrounding template matches. Numbers are ignored here
+    because shared/different thresholds are handled by entity_boost.
+    """
+    a, b = content_tokens(t1), content_tokens(t2)
+    only1 = {w for w in a - b if w.isalpha() and len(w) >= 4}
+    only2 = {w for w in b - a if w.isalpha() and len(w) >= 4}
+    return 0.30 if only1 and only2 else 0.0
 
 
 def category(text: str) -> str:
@@ -312,7 +369,7 @@ async def main():
                     if abs(pm_gamma_mid - km_mid) > 0.30:
                         continue
 
-                s = similarity(pq, kt) + entity_boost(pq, kt)
+                s = similarity(pq, kt) + entity_boost(pq, kt) - discriminator_penalty(pq, kt)
                 s = min(s, 1.0)
                 if s > best_score:
                     best_score = s
