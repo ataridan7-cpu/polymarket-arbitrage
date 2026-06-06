@@ -22,7 +22,7 @@ TAKER_FEE  = 0.015     # 1.5% taker fee per leg
 MIN_EDGE   = 0.005     # 0.5% net edge after fees
 MM_SPREAD  = 0.02      # flag spreads ≥ 2¢ (strong ≥ 4¢, marginal 2–4¢)
 FETCH_N    = 500       # fetch this many markets from Gamma
-SCAN_CAP   = 200       # scan at most this many after filtering
+SCAN_CAP   = 500       # scan all fetched markets (was 200)
 MIN_VOLUME = 500       # skip markets with < $500 daily volume
 CONTESTED  = (0.08, 0.92)   # only contested markets (YES mid in this range)
 
