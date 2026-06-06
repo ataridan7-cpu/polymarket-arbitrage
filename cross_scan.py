@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Cross-Platform Scanner: Polymarket vs Kalshi
-============================================
-Finds price gaps for the same prediction on both platforms.
+Cross-Platform Scanner: Polymarket vs Kalshi + PredictIt
+=========================================================
+Finds price gaps for the same prediction across platforms.
 """
 
 import asyncio
@@ -11,15 +11,20 @@ import json
 import sys
 from difflib import SequenceMatcher
 
+from utils.kelly import kelly_contracts
+from utils.predictit import get_predictit_markets, predictit_fee
+
 GAMMA_URL  = "https://gamma-api.polymarket.com"
 CLOB_URL   = "https://clob.polymarket.com"
 KALSHI_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
-POLY_FEE   = 0.015    # 1.5% taker fee
-KALSHI_FEE = 0.01     # legacy flat-fee constant; real fee modeled in kalshi_fee()
-MIN_EDGE   = 0.02     # 2% minimum net edge to signal
-SIM_THRESH = 0.72     # minimum text similarity to consider a match
-POLY_N     = 500      # number of Polymarket markets to fetch
+POLY_FEE    = 0.015   # 1.5% taker fee
+KALSHI_FEE  = 0.01    # legacy flat-fee constant; real fee modeled in kalshi_fee()
+PI_FEE_RATE = 0.10    # PredictIt 10% of profits fee
+MIN_EDGE    = 0.02    # 2% minimum net edge to signal
+SIM_THRESH  = 0.72    # minimum text similarity to consider a match
+POLY_N      = 500     # number of Polymarket markets to fetch
+DEMO_BANKROLL = 1000.0  # paper-trading bankroll for Kelly sizing
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -511,9 +516,10 @@ async def main():
         print("     Always read both question texts before trading.")
         print()
         for a in genuine_arbs[:10]:
-            # Suggested size: 1% of 24h volume, capped at $200, floored at $10
-            suggested = max(10.0, min(200.0, a["vol24h"] * 0.01))
-            contracts = int(suggested / a["buy_price"])
+            # Kelly-optimal sizing (half-Kelly, capped at 20% of demo bankroll)
+            contracts, dollar_size = kelly_contracts(
+                0.5, a["buy_price"], DEMO_BANKROLL
+            )
             exp_profit = contracts * a["net_edge"]
             fees      = a.get("fees", 0)
             fee_poly  = a.get("fee_poly", 0)
@@ -595,9 +601,129 @@ async def main():
                 print(f"  → Kalshi:     {kalshi_url}")
             print()
 
+    # ── PredictIt cross-scan ──────────────────────────────────────────────────
+    print("\n" + "=" * 72)
+    print("  Cross-Platform Scanner: Polymarket  ↔  PredictIt  —  live prices")
     print("=" * 72)
-    print(f"Kalshi markets scanned: {len(kalshi)}   Poly markets scanned: {len(poly_liquid)}")
-    print(f"Same-category pairs checked: {len(price_diffs)}   Genuine arb signals: {len(genuine_arbs)}")
+    print("\n[PI] Fetching PredictIt markets…")
+    pi_markets = await asyncio.get_event_loop().run_in_executor(
+        None, get_predictit_markets
+    )
+    print(f"     {len(pi_markets)} PredictIt contracts with prices")
+
+    print("[PI] Matching Polymarket ↔ PredictIt…")
+    pi_pairs = []
+    for pm in poly_liquid:
+        pq = pm.get("question") or ""
+        if not pq:
+            continue
+        pq_cat = category(pq)
+        if pq_cat == "other":
+            continue
+        pm_mid = poly_gamma_mid(pm)
+        best_score, best_pi = 0.0, None
+        for pi in pi_markets:
+            pt = pi.get("question") or ""
+            if category(pt) != pq_cat:
+                continue
+            if pm_mid is not None and pi.get("mid") is not None:
+                if abs(pm_mid - pi["mid"]) > 0.30:
+                    continue
+            s = similarity(pq, pt) + entity_boost(pq, pt) - discriminator_penalty(pq, pt)
+            s = min(s, 1.0)
+            if s > best_score:
+                best_score, best_pi = s, pi
+        if best_score >= SIM_THRESH and best_pi:
+            pi_pairs.append((best_score, pm, best_pi))
+
+    pi_pairs.sort(key=lambda x: -x[0])
+    print(f"     {len(pi_pairs)} PredictIt matches above {SIM_THRESH:.0%} similarity")
+
+    pi_arbs = []
+    for score, pm, pi in pi_pairs[:30]:
+        tok_raw = pm.get("clobTokenIds", "")
+        ob, _ = await get_poly_ob(client, tok_raw)
+        if not ob:
+            continue
+
+        ya   = pi.get("yes_ask")
+        na   = pi.get("no_ask")
+        slug = pm.get("slug") or pm.get("market_slug") or ""
+        poly_url = f"https://polymarket.com/event/{slug}" if slug else ""
+        pi_url   = pi.get("url", "")
+
+        # Case E: Buy Poly YES + PredictIt NO
+        if ob["yes_ask"] and na:
+            cost    = ob["yes_ask"] + na
+            fp      = round(ob["yes_ask"] * POLY_FEE, 5)
+            fpi     = round(predictit_fee(na), 5)       # 10% of (1−na) on PI NO win
+            fees    = fp + fpi
+            gross   = round(1.0 - cost, 4)
+            net     = round(gross - fees, 4)
+            if net >= MIN_EDGE:
+                pi_arbs.append({
+                    "type":       "Bundle: Buy Poly YES + PredictIt NO",
+                    "net_edge":   net, "gross_edge": gross, "fees": fees,
+                    "buy_price":  cost, "similarity": score,
+                    "vol24h":     float(pm.get("volume24hr") or 0),
+                    "poly_q":     pm.get("question") or "",
+                    "pi_q":       pi.get("question") or "",
+                    "leg1":       f"Buy YES on Polymarket  @ ${ob['yes_ask']:.3f}  (fee: ${fp:.4f})",
+                    "leg2":       f"Buy NO  on PredictIt   @ ${na:.3f}  (fee: ${fpi:.4f})",
+                    "poly_url":   poly_url, "pi_url": pi_url,
+                })
+
+        # Case F: Buy PredictIt YES + Poly NO
+        if ya and ob["no_ask"]:
+            cost    = ya + ob["no_ask"]
+            fp      = round(ob["no_ask"] * POLY_FEE, 5)
+            fpi     = round(predictit_fee(ya), 5)       # 10% of (1−ya) on PI YES win
+            fees    = fp + fpi
+            gross   = round(1.0 - cost, 4)
+            net     = round(gross - fees, 4)
+            if net >= MIN_EDGE:
+                pi_arbs.append({
+                    "type":       "Bundle: Buy PredictIt YES + Poly NO",
+                    "net_edge":   net, "gross_edge": gross, "fees": fees,
+                    "buy_price":  cost, "similarity": score,
+                    "vol24h":     float(pm.get("volume24hr") or 0),
+                    "poly_q":     pm.get("question") or "",
+                    "pi_q":       pi.get("question") or "",
+                    "leg1":       f"Buy YES on PredictIt   @ ${ya:.3f}  (fee: ${fpi:.4f})",
+                    "leg2":       f"Buy NO  on Polymarket  @ ${ob['no_ask']:.3f}  (fee: ${fp:.4f})",
+                    "poly_url":   poly_url, "pi_url": pi_url,
+                })
+
+        await asyncio.sleep(0.03)
+
+    pi_arbs.sort(key=lambda x: -x["net_edge"])
+    print()
+    if pi_arbs:
+        print("╔══════════════════════════════════════════════════════════════════════╗")
+        print("║  POLY ↔ PREDICTIT BUNDLE ARB                                        ║")
+        print("╚══════════════════════════════════════════════════════════════════════╝")
+        for a in pi_arbs[:10]:
+            contracts, dollar_size = kelly_contracts(0.5, a["buy_price"], DEMO_BANKROLL)
+            exp_profit = contracts * a["net_edge"]
+            print(f"  ┌─ {a['type']}")
+            print(f"  │  Cost ${a['buy_price']:.3f}  Gross ${a['gross_edge']:.3f}  Fees ${a['fees']:.4f}  Net ${a['net_edge']:.3f} ({a['net_edge']*100:+.2f}%)")
+            print(f"  │  Match: {a['similarity']:.2f}   Vol24h: ${a['vol24h']:,.0f}")
+            print(f"  │  Poly:       {a['poly_q'][:65]}")
+            print(f"  │  PredictIt:  {a['pi_q'][:65]}")
+            print(f"  │  LEG 1 — {a['leg1']}")
+            print(f"  │  LEG 2 — {a['leg2']}")
+            print(f"  │  Polymarket: {a['poly_url']}")
+            print(f"  │  PredictIt:  {a['pi_url']}")
+            print(f"  │  Kelly size: {contracts} contracts (~${dollar_size:.0f})  Expected profit: ~${exp_profit:.2f}")
+            print(f"  └─ ⚠  PredictIt fees are 10% of profits — verify before trading")
+            print()
+    else:
+        print("  ✗ No Poly ↔ PredictIt arb found.\n")
+
+    print("=" * 72)
+    print(f"Polymarket markets: {len(poly_liquid)}   Kalshi: {len(kalshi)}   PredictIt: {len(pi_markets)}")
+    print(f"Kalshi pairs: {len(price_diffs)}   Genuine Kalshi arbs: {len(genuine_arbs)}")
+    print(f"PredictIt pairs: {len(pi_pairs)}   Genuine PredictIt arbs: {len(pi_arbs)}")
     print("=" * 72)
 
 
