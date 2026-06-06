@@ -443,16 +443,12 @@ async def main():
         print("  Genuine cross-platform arb requires both platforms asking the exact")
         print("  same YES/NO question — which is rare today.\n")
 
-    # Collect quick links from arb signals
-    quick_links = []
+    # Each entry: (label, poly_url, kalshi_url)
+    link_pairs = []
     for a in genuine_arbs[:10]:
-        if a.get("poly_url"):
-            quick_links.append((f"Polymarket  {a['type'][:40]}", a["poly_url"]))
-        if a.get("kalshi_url"):
-            quick_links.append((f"Kalshi      {a['type'][:40]}", a["kalshi_url"]))
+        link_pairs.append((a["type"], a.get("poly_url", ""), a.get("kalshi_url", "")))
 
     # Show closest candidate pairs for manual review
-    pair_links = []
     if price_diffs:
         price_diffs.sort(key=lambda x: -x[0])   # sort by similarity score
         print("╔══════════════════════════════════════════════════════════════════════╗")
@@ -464,20 +460,18 @@ async def main():
                 direction = "Poly higher" if pm_mid > km_mid else "Kalshi higher"
                 slug        = pm.get("slug") or pm.get("market_slug") or ""
                 k_event     = km.get("event_ticker") or km.get("ticker") or ""
-                poly_url    = f"https://polymarket.com/event/{slug}" if slug else None
-                kalshi_url  = f"https://kalshi.com/markets/{k_event}" if k_event else None
+                poly_url    = f"https://polymarket.com/event/{slug}" if slug else ""
+                kalshi_url  = f"https://kalshi.com/markets/{k_event}" if k_event else ""
                 print(f"  Similarity: {score:.2f}  Gap: {diff*100:.1f}¢ ({direction})")
                 print(f"  Poly   [{pm_mid:.3f}]: {(pm.get('question') or '')[:70]}")
                 print(f"  Kalshi [{km_mid:.3f}]: {(km.get('title') or '')[:70]}")
                 if poly_url:
-                    print(f"  → {poly_url}")
+                    print(f"  → Polymarket: {poly_url}")
                 if kalshi_url:
-                    print(f"  → {kalshi_url}")
+                    print(f"  → Kalshi:     {kalshi_url}")
                 print()
-                if poly_url:
-                    pair_links.append((f"Poly  [{pm_mid:.2f}] {(pm.get('question') or '')[:50]}", poly_url))
-                if kalshi_url:
-                    pair_links.append((f"Kalshi[{km_mid:.2f}] {(km.get('title') or '')[:50]}", kalshi_url))
+                label = f"Match {score:.2f} | {(pm.get('question') or '')[:45]}"
+                link_pairs.append((label, poly_url, kalshi_url))
                 shown += 1
                 if shown >= 10:
                     break
@@ -485,14 +479,16 @@ async def main():
             print("  No same-category pairs found in top matches.\n")
 
     # ---- QUICK LINKS ----
-    all_links = quick_links + pair_links
-    if all_links:
+    if link_pairs:
         print("╔══════════════════════════════════════════════════════════════════════╗")
         print("║  QUICK LINKS  —  open these markets                                 ║")
         print("╚══════════════════════════════════════════════════════════════════════╝")
-        for label, url in all_links:
+        for label, poly_url, kalshi_url in link_pairs:
             print(f"  {label}")
-            print(f"  → {url}")
+            if poly_url:
+                print(f"  → Polymarket: {poly_url}")
+            if kalshi_url:
+                print(f"  → Kalshi:     {kalshi_url}")
             print()
 
     print("=" * 72)
