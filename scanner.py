@@ -289,12 +289,18 @@ async def main():
         print(f"  {url}")
         print()
 
+    link_sections = []   # (label, url) collected as we print
+
     if mm_strong:
         print("╔══════════════════════════════════════════════════════════════════════╗")
         print("║  MM LEADS — STRONG  (spread ≥ 4¢)                                  ║")
         print("╚══════════════════════════════════════════════════════════════════════╝")
         for r in mm_strong[:10]:
             print_mm_row(r)
+            url = f"https://polymarket.com/event/{r['slug']}" if r["slug"] else None
+            if url:
+                sp = max(r["yes"].spread or 0, r["no"].spread or 0)
+                link_sections.append((f"MM STRONG {sp*100:.1f}¢  {r['question'][:55]}", url))
     else:
         print("  ✗ No strong MM leads (≥ 4¢) in contested markets\n")
 
@@ -304,8 +310,32 @@ async def main():
         print("╚══════════════════════════════════════════════════════════════════════╝")
         for r in mm_marginal[:10]:
             print_mm_row(r)
+            url = f"https://polymarket.com/event/{r['slug']}" if r["slug"] else None
+            if url:
+                sp = max(r["yes"].spread or 0, r["no"].spread or 0)
+                link_sections.append((f"MM {sp*100:.1f}¢  {r['question'][:60]}", url))
     else:
         print("  ✗ No marginal MM leads (2–4¢) in contested markets\n")
+
+    for r in buy_arbs[:10]:
+        url = f"https://polymarket.com/event/{r['slug']}" if r["slug"] else None
+        if url:
+            link_sections.insert(0, (f"BUY ARB {r['edge_buy']*100:+.2f}%  {r['question'][:52]}", url))
+
+    for r in sell_arbs[:10]:
+        url = f"https://polymarket.com/event/{r['slug']}" if r["slug"] else None
+        if url:
+            link_sections.insert(0, (f"SELL ARB {r['edge_sell']*100:+.2f}%  {r['question'][:51]}", url))
+
+    # ---- QUICK LINKS ----
+    if link_sections:
+        print("╔══════════════════════════════════════════════════════════════════════╗")
+        print("║  QUICK LINKS  —  open these markets                                 ║")
+        print("╚══════════════════════════════════════════════════════════════════════╝")
+        for label, url in link_sections:
+            print(f"  {label}")
+            print(f"  → {url}")
+            print()
 
     # ---- SUMMARY STATS ----
     print("=" * 72)
