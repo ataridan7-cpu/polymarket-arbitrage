@@ -16,7 +16,7 @@ CLOB_URL   = "https://clob.polymarket.com"
 KALSHI_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
 POLY_FEE   = 0.015    # 1.5% taker fee
-KALSHI_FEE = 0.01     # ~1% taker fee
+KALSHI_FEE = 0.01     # legacy flat-fee constant; real fee modeled in kalshi_fee()
 MIN_EDGE   = 0.02     # 2% minimum net edge to signal
 SIM_THRESH = 0.72     # minimum text similarity to consider a match
 POLY_N     = 500      # number of Polymarket markets to fetch
@@ -50,30 +50,48 @@ KALSHI_SERIES = [
 ]
 
 
+# Max series we will actually fetch markets for. The matcher only keeps markets
+# in known categories (see category()), so fetching the full active set —
+# ~10,700 series, the vast majority unmatchable songs/films/foreign elections —
+# is pure waste and takes >70 min serially. We cap to a relevant shortlist.
+MAX_KALSHI_SERIES = 40
+
+
 async def discover_kalshi_series(client) -> list[str]:
-    """Fetch active series tickers from API; fall back to KALSHI_SERIES."""
+    """
+    Build a shortlist of Kalshi series worth scanning.
+
+    Starts from the curated KALSHI_SERIES (guaranteed coverage), then unions in
+    any *active* series whose ticker maps to a known category() bucket
+    (crypto / macro / politics / elon). Anything else can never match a
+    Polymarket market, so it is dropped. The API ignores `limit` on /series
+    (it returns the full ~10.7k set), so we filter client-side and cap the
+    result to keep the markets fetch fast.
+    """
+    series: list[str] = list(KALSHI_SERIES)
+    seen = set(series)
     try:
         r = await client.get(f"{KALSHI_URL}/series",
-                             params={"status": "active", "limit": 200},
+                             params={"status": "active"},
                              timeout=15)
         if r.status_code == 200:
-            tickers = [s["ticker"] for s in r.json().get("series", []) if s.get("ticker")]
-            if tickers:
-                return tickers
+            for s in r.json().get("series", []):
+                ticker = s.get("ticker")
+                if not ticker or ticker in seen:
+                    continue
+                # Match against the same buckets the matcher uses downstream.
+                text = f"{ticker} {s.get('title') or ''}"
+                if category(text) != "other":
+                    series.append(ticker)
+                    seen.add(ticker)
     except Exception:
         pass
-    return list(KALSHI_SERIES)
+    return series[:MAX_KALSHI_SERIES]
 
 
-async def get_kalshi_markets(client):
-    """
-    Fetch simple binary Kalshi markets by series tickers.
-    Dynamically discovers series; falls back to hardcoded list.
-    Avoids paginating through 15,000+ multi-leg sports markets.
-    """
-    series_list = await discover_kalshi_series(client)
-    markets = []
-    for series in series_list:
+async def _fetch_kalshi_series(client, sem, series):
+    """Fetch open binary markets for one series, with 429 backoff."""
+    async with sem:
         for attempt in range(3):
             try:
                 r = await client.get(f"{KALSHI_URL}/markets",
@@ -85,11 +103,26 @@ async def get_kalshi_markets(client):
                     continue
                 r.raise_for_status()
                 batch = r.json().get("markets", [])
-                markets.extend(m for m in batch if not m.get("mve_collection_ticker"))
-                break
+                return [m for m in batch if not m.get("mve_collection_ticker")]
             except Exception:
                 await asyncio.sleep(2 ** attempt)
-        await asyncio.sleep(0.4)   # be polite between series
+        return []
+
+
+async def get_kalshi_markets(client):
+    """
+    Fetch simple binary Kalshi markets for the relevant series shortlist.
+
+    Series are fetched concurrently (bounded by a semaphore) rather than in a
+    serial loop with fixed sleeps — this takes the step from ~70 min to a few
+    seconds. Multi-leg sports markets are excluded.
+    """
+    series_list = await discover_kalshi_series(client)
+    sem = asyncio.Semaphore(6)
+    results = await asyncio.gather(
+        *(_fetch_kalshi_series(client, sem, s) for s in series_list)
+    )
+    markets = [m for batch in results for m in batch]
     return markets
 
 
@@ -119,6 +152,20 @@ def poly_mid(ob):
     ba, bb = ob.get("yes_ask"), ob.get("yes_bid")
     if ba and bb: return (ba + bb) / 2
     return ba or bb
+
+
+def kalshi_fee(price):
+    """
+    Kalshi per-contract trading fee as a fraction of $1.
+
+    Kalshi charges ceil(0.07 * contracts * price * (1 - price)) cents per order;
+    the per-contract fee is therefore 0.07 * price * (1 - price). It peaks near
+    50¢ (~1.75¢) and shrinks toward the tails — unlike the old flat 1%, which
+    overcharged the tails and undercharged the middle. We use the unrounded
+    fraction so the edge math stays size-agnostic.
+    """
+    p = max(0.0, min(1.0, float(price)))
+    return 0.07 * p * (1.0 - p)
 
 
 # Kalshi market titles that are price-bracket or time-specific snapshots —
@@ -324,7 +371,7 @@ async def main():
             if ob["yes_ask"] and km_no_ask:
                 cost       = ob["yes_ask"] + km_no_ask
                 fee_poly   = round(ob["yes_ask"] * POLY_FEE, 5)
-                fee_kalshi = round(km_no_ask * KALSHI_FEE, 5)
+                fee_kalshi = round(kalshi_fee(km_no_ask), 5)
                 fees       = fee_poly + fee_kalshi
                 gross      = round(1.0 - cost, 4)
                 net        = round(gross - fees, 4)
@@ -346,7 +393,7 @@ async def main():
             # Case D: Buy Kalshi YES + Buy Poly NO → collect $1 either way
             if km_yes_ask and ob["no_ask"]:
                 cost       = km_yes_ask + ob["no_ask"]
-                fee_kalshi = round(km_yes_ask * KALSHI_FEE, 5)
+                fee_kalshi = round(kalshi_fee(km_yes_ask), 5)
                 fee_poly   = round(ob["no_ask"] * POLY_FEE, 5)
                 fees       = fee_kalshi + fee_poly
                 gross      = round(1.0 - cost, 4)
@@ -416,7 +463,7 @@ async def main():
             fee_kalshi= a.get("fee_kalshi", 0)
             print(f"  ┌─ {a['type']}")
             print(f"  │  Cost: ${a['buy_price']:.3f}  →  Gross: ${a['gross_edge']:.3f}  −  Fees: ${fees:.4f}  =  Net: ${a['net_edge']:.3f} ({a['net_edge']*100:+.2f}%)")
-            print(f"  │  Fees: Poly ${fee_poly:.4f} ({POLY_FEE*100:.1f}%)  +  Kalshi ${fee_kalshi:.4f} ({KALSHI_FEE*100:.1f}%)")
+            print(f"  │  Fees: Poly ${fee_poly:.4f} ({POLY_FEE*100:.1f}%)  +  Kalshi ${fee_kalshi:.4f} (0.07·p·(1−p))")
             print(f"  │  Match score: {a['similarity']:.2f}   Vol24h: ${a['vol24h']:,.0f}")
             if a.get("close_time"):
                 print(f"  │  Resolves: {a['close_time']}")
