@@ -13,6 +13,7 @@ from difflib import SequenceMatcher
 
 from utils.kelly import kelly_contracts
 from utils.predictit import get_predictit_markets, predictit_fee
+from utils.manifold import get_manifold_markets
 
 GAMMA_URL  = "https://gamma-api.polymarket.com"
 CLOB_URL   = "https://clob.polymarket.com"
@@ -280,6 +281,11 @@ def category(text: str) -> str:
     if any(k in t for k in ["federal funds","fed rate","interest rate","fomc",
                               "basis point","bps","rate cut","rate hike",
                               "monetary policy","rate decision"]):
+        # Exclude non-Fed central banks (ECB, BoE, BoJ, etc.)
+        if any(k in t for k in ["ecb","european central","bank of england","boe",
+                                  "bank of japan","boj","bank of canada","rba",
+                                  "reserve bank"]):
+            return "other"
         return "fed"
     if any(k in t for k in ["gdp","gross domestic"]):
         return "gdp"
@@ -410,8 +416,23 @@ def entity_boost(t1, t2):
 
 async def main():
     print("=" * 72)
-    print("  Cross-Platform Scanner: Polymarket  ↔  Kalshi  —  live prices")
+    print("  Cross-Platform Scanner: Polymarket / Kalshi / PredictIt / Manifold")
     print("=" * 72)
+    print()
+    print("  PLATFORM FEE COMPARISON")
+    print("  ─────────────────────────────────────────────────────────────────")
+    print("  Platform    Fee model                     At 10¢   At 50¢   At 90¢")
+    print("  ──────────  ────────────────────────────  ───────  ───────  ───────")
+    print("  Polymarket  1.5% flat taker on entry      1.50%    1.50%    1.50%")
+    print("  Kalshi      7%×p×(1−p) per contract       0.63%    1.75%    0.63%  ← cheapest at tails")
+    print("  PredictIt   10% of profit on winning leg  90.0%    5.00%    1.11%  ← very expensive <80¢")
+    print("  Manifold    0%  (play money — mana)       —        —        —      ← signal only")
+    print()
+    print("  Rule of thumb:  p < 31¢ or p > 69¢  →  Kalshi cheapest")
+    print("                  31¢ ≤ p ≤ 69¢         →  Polymarket cheapest")
+    print("                  PredictIt only worth trading at p > 90¢ (fee ≈ 1%)")
+    print("  ─────────────────────────────────────────────────────────────────")
+    print()
 
     async with httpx.AsyncClient() as client:
         print(f"\n[1/4] Fetching Polymarket top {POLY_N} markets…")
@@ -853,10 +874,96 @@ async def main():
     else:
         print("  ✗ No Poly ↔ PredictIt arb found.\n")
 
+    # ── Manifold price-signal comparison ─────────────────────────────────────
+    print("\n" + "=" * 72)
+    print("  Price-Signal Comparison: Polymarket  ↔  Manifold  (play money)")
     print("=" * 72)
-    print(f"Polymarket markets: {len(poly_liquid)}   Kalshi: {len(kalshi)}   PredictIt: {len(pi_markets)}")
-    print(f"Kalshi pairs: {len(price_diffs)}   Genuine Kalshi arbs: {len(genuine_arbs)}")
-    print(f"PredictIt pairs: {len(pi_pairs)}   Genuine PredictIt arbs: {len(pi_arbs)}")
+    print("  Manifold uses mana (play money). Divergences ≥ 5¢ from Polymarket")
+    print("  may flag genuine mispricings worth investigating on real platforms.")
+    print()
+    print("[MF] Fetching Manifold markets…")
+    mf_markets = await asyncio.get_event_loop().run_in_executor(
+        None, get_manifold_markets
+    )
+    print(f"     {len(mf_markets)} Manifold binary markets fetched")
+
+    mf_pairs = []
+    for pm in poly_liquid:
+        pq = pm.get("question") or ""
+        if not pq:
+            continue
+        pq_cat = category(pq)
+        if pq_cat not in ACTIVE_CATEGORIES:
+            continue
+        pm_mid = poly_gamma_mid(pm)
+        best_score, best_mf = 0.0, None
+        for mf in mf_markets:
+            mt = mf.get("question") or ""
+            if not mt or category(mt) != pq_cat:
+                continue
+            if pq_cat == "fed":
+                fomc_pm = extract_fomc_key(pq)
+                fomc_mf = extract_fomc_key(mt)
+                if fomc_pm and fomc_mf:
+                    if fomc_pm != fomc_mf:
+                        continue
+                    s = min(0.76 + entity_boost(pq, mt), 1.0)
+                else:
+                    s = min(similarity(pq, mt) + entity_boost(pq, mt) + fed_month_boost(pq, mt), 1.0)
+            else:
+                # Wider price guard for play-money signal (40¢ instead of 30¢)
+                if pm_mid is not None and abs(pm_mid - mf["mid"]) > 0.40:
+                    continue
+                s = similarity(pq, mt) + entity_boost(pq, mt) - discriminator_penalty(pq, mt)
+                s = min(s, 1.0)
+            if s > best_score:
+                best_score, best_mf = s, mf
+
+        if best_score >= SIM_THRESH and best_mf:
+            mf_pairs.append((best_score, pm, best_mf))
+
+    mf_pairs.sort(key=lambda x: -x[0])
+    print(f"[MF] {len(mf_pairs)} Manifold matches above {SIM_THRESH:.0%} similarity")
+
+    if mf_pairs:
+        print()
+        print("╔══════════════════════════════════════════════════════════════════════╗")
+        print("║  MANIFOLD ↔ POLYMARKET PRICE DIVERGENCES  (signal — not real arb)  ║")
+        print("╚══════════════════════════════════════════════════════════════════════╝")
+        shown = 0
+        for score, pm, mf in mf_pairs:
+            pm_mid = poly_gamma_mid(pm)
+            mf_mid = mf.get("mid")
+            if pm_mid is None or mf_mid is None:
+                continue
+            diff = abs(pm_mid - mf_mid)
+            if diff < 0.02:
+                continue
+            direction = "Poly higher" if pm_mid > mf_mid else "Manifold higher"
+            slug      = pm.get("slug") or pm.get("market_slug") or ""
+            poly_url  = f"https://polymarket.com/event/{slug}" if slug else ""
+            print(f"  Match {score:.2f}  Gap: {diff*100:.1f}¢ ({direction})")
+            print(f"  Poly     [{pm_mid:.3f}]: {(pm.get('question') or '')[:65]}")
+            print(f"  Manifold [{mf_mid:.3f}]: {(mf.get('question') or '')[:65]}")
+            if poly_url:
+                print(f"  → Polymarket: {poly_url}")
+            if mf.get("url"):
+                print(f"  → Manifold:   {mf['url']}")
+            print()
+            shown += 1
+            if shown >= 10:
+                break
+        if shown == 0:
+            print("  No divergences ≥ 2¢ found — prices are aligned.\n")
+    else:
+        print("  No Manifold matches found.\n")
+
+    print("=" * 72)
+    print(f"  SUMMARY STATS")
+    print(f"  Polymarket: {len(poly_liquid)} liquid markets   Kalshi: {len(kalshi)}   PredictIt: {len(pi_markets)}   Manifold: {len(mf_markets)}")
+    print(f"  Kalshi pairs: {len(price_diffs)}   Genuine Kalshi arbs: {len(genuine_arbs)}")
+    print(f"  PredictIt pairs: {len(pi_pairs)}   Genuine PredictIt arbs: {len(pi_arbs)}")
+    print(f"  Manifold signal pairs: {len(mf_pairs)}")
     print("=" * 72)
 
 
