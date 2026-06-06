@@ -49,13 +49,31 @@ KALSHI_SERIES = [
     "KXHIGHNY","KXHIGHLA","KXRAIN",
 ]
 
+
+async def discover_kalshi_series(client) -> list[str]:
+    """Fetch active series tickers from API; fall back to KALSHI_SERIES."""
+    try:
+        r = await client.get(f"{KALSHI_URL}/series",
+                             params={"status": "active", "limit": 200},
+                             timeout=15)
+        if r.status_code == 200:
+            tickers = [s["ticker"] for s in r.json().get("series", []) if s.get("ticker")]
+            if tickers:
+                return tickers
+    except Exception:
+        pass
+    return list(KALSHI_SERIES)
+
+
 async def get_kalshi_markets(client):
     """
-    Fetch simple binary Kalshi markets by known series tickers.
+    Fetch simple binary Kalshi markets by series tickers.
+    Dynamically discovers series; falls back to hardcoded list.
     Avoids paginating through 15,000+ multi-leg sports markets.
     """
+    series_list = await discover_kalshi_series(client)
     markets = []
-    for series in KALSHI_SERIES:
+    for series in series_list:
         for attempt in range(3):
             try:
                 r = await client.get(f"{KALSHI_URL}/markets",
@@ -230,9 +248,14 @@ async def main():
             pm_gamma_mid = poly_gamma_mid(pm)
 
             best_score, best_km = 0.0, None
+            pq_cat = category(pq)
             for km in kalshi:
                 kt = km.get("title") or ""
                 if not kt:
+                    continue
+
+                # Skip pairs in different or uncategorised buckets before any scoring
+                if pq_cat == "other" or category(kt) != pq_cat:
                     continue
 
                 # Price-proximity guard: skip if prices differ by more than 30¢

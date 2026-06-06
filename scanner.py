@@ -20,7 +20,7 @@ GAMMA_URL  = "https://gamma-api.polymarket.com"
 CLOB_URL   = "https://clob.polymarket.com"
 TAKER_FEE  = 0.015     # 1.5% taker fee per leg
 MIN_EDGE   = 0.005     # 0.5% net edge after fees
-MM_SPREAD  = 0.04      # flag spreads ≥ 4¢
+MM_SPREAD  = 0.02      # flag spreads ≥ 2¢ (strong ≥ 4¢, marginal 2–4¢)
 FETCH_N    = 500       # fetch this many markets from Gamma
 SCAN_CAP   = 200       # scan at most this many after filtering
 MIN_VOLUME = 500       # skip markets with < $500 daily volume
@@ -82,6 +82,14 @@ async def fetch_book(client: httpx.AsyncClient, token_id: str) -> Optional[dict]
         return None
 
 
+def top3_depth(book: dict, side: str) -> float:
+    """Total size at the top 3 price levels on the given side ('bids' or 'asks')."""
+    levels = book.get(side, [])
+    reverse = (side == "bids")
+    levels_sorted = sorted(levels, key=lambda x: float(x["price"]), reverse=reverse)
+    return sum(float(x.get("size", 0)) for x in levels_sorted[:3])
+
+
 async def scan_one(client: httpx.AsyncClient, m: dict) -> Optional[dict]:
     try:
         tok_raw = m.get("clobTokenIds", "")
@@ -129,14 +137,21 @@ async def scan_one(client: httpx.AsyncClient, m: dict) -> Optional[dict]:
         fees      = revenue * TAKER_FEE
         edge_sell = round(revenue - fees - 1.0, 4)
 
+    slug = m.get("slug") or m.get("market_slug") or ""
+    yes_bid_depth = top3_depth(yb_raw, "bids")
+    yes_ask_depth = top3_depth(yb_raw, "asks")
+
     return {
-        "id":         str(m.get("id", "")),
-        "question":   (m.get("question") or "?")[:90],
-        "vol24h":     vol,
-        "yes":        yes,
-        "no":         no,
-        "edge_buy":   edge_buy,
-        "edge_sell":  edge_sell,
+        "id":            str(m.get("id", "")),
+        "question":      (m.get("question") or "?")[:90],
+        "vol24h":        vol,
+        "yes":           yes,
+        "no":            no,
+        "edge_buy":      edge_buy,
+        "edge_sell":     edge_sell,
+        "slug":          slug,
+        "yes_bid_depth": yes_bid_depth,
+        "yes_ask_depth": yes_ask_depth,
     }
 
 
@@ -211,31 +226,48 @@ async def main():
         print("  ✗ No bundle SELL arb found\n")
 
     # ---- MARKET MAKING ----
-    mm_leads = sorted(
+    mm_all = sorted(
         [r for r in results if
          (r["yes"].spread and r["yes"].spread >= MM_SPREAD) or
          (r["no"].spread  and r["no"].spread  >= MM_SPREAD)],
         key=lambda x: -(max(x["yes"].spread or 0, x["no"].spread or 0))
     )
-    if mm_leads:
+    mm_strong   = [r for r in mm_all if max(r["yes"].spread or 0, r["no"].spread or 0) >= 0.04]
+    mm_marginal = [r for r in mm_all if max(r["yes"].spread or 0, r["no"].spread or 0) < 0.04]
+
+    def print_mm_row(r):
+        ys = r["yes"].spread or 0
+        ns = r["no"].spread  or 0
+        url = f"https://polymarket.com/event/{r['slug']}" if r["slug"] else "(no slug)"
+        print(f"  YES spread: {ys*100:.1f}¢  (bid {r['yes'].best_bid or 0:.3f} / ask {r['yes'].best_ask or 0:.3f}  depth top-3: {r['yes_bid_depth']:.0f} / {r['yes_ask_depth']:.0f})")
+        print(f"  NO  spread: {ns*100:.1f}¢  (bid {r['no'].best_bid  or 0:.3f} / ask {r['no'].best_ask  or 0:.3f})")
+        print(f"  Vol24h: ${r['vol24h']:,.0f}   mid YES: {r['yes'].mid:.3f}")
+        print(f"  {r['question']}")
+        print(f"  {url}")
+        print()
+
+    if mm_strong:
         print("╔══════════════════════════════════════════════════════════════════════╗")
-        print("║  MARKET-MAKING LEADS  —  contested markets with wide spreads        ║")
+        print("║  MM LEADS — STRONG  (spread ≥ 4¢)                                  ║")
         print("╚══════════════════════════════════════════════════════════════════════╝")
-        for r in mm_leads[:20]:
-            ys = r["yes"].spread or 0
-            ns = r["no"].spread  or 0
-            print(f"  YES spread: {ys*100:.1f}¢  (bid {r['yes'].best_bid or '-':.3f} / ask {r['yes'].best_ask or '-':.3f})")
-            print(f"  NO  spread: {ns*100:.1f}¢  (bid {r['no'].best_bid  or '-':.3f} / ask {r['no'].best_ask  or '-':.3f})")
-            print(f"  Vol24h: ${r['vol24h']:,.0f}   mid YES: {r['yes'].mid:.3f}")
-            print(f"  {r['question']}")
-            print()
+        for r in mm_strong[:10]:
+            print_mm_row(r)
     else:
-        print("  ✗ No wide-spread MM opportunities in contested markets\n")
+        print("  ✗ No strong MM leads (≥ 4¢) in contested markets\n")
+
+    if mm_marginal:
+        print("╔══════════════════════════════════════════════════════════════════════╗")
+        print("║  MM LEADS — MARGINAL  (spread 2–4¢)                                ║")
+        print("╚══════════════════════════════════════════════════════════════════════╝")
+        for r in mm_marginal[:10]:
+            print_mm_row(r)
+    else:
+        print("  ✗ No marginal MM leads (2–4¢) in contested markets\n")
 
     # ---- SUMMARY STATS ----
     print("=" * 72)
     print(f"Scanned: {len(to_scan)} markets   Contested (price 8%–92%): {len(results)}")
-    print(f"Bundle buy arb: {len(buy_arbs)}   Bundle sell arb: {len(sell_arbs)}   MM leads: {len(mm_leads)}")
+    print(f"Bundle buy arb: {len(buy_arbs)}   Bundle sell arb: {len(sell_arbs)}   MM leads: {len(mm_all)} ({len(mm_strong)} strong, {len(mm_marginal)} marginal)")
 
     # Show YES/NO price distribution for contested markets
     if results:

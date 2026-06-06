@@ -219,6 +219,21 @@ class KalshiClient:
         "KXHIGHNY","KXHIGHLA","KXRAIN",
     ]
 
+    async def _discover_series(self) -> list[str]:
+        """
+        Fetch active series tickers from the API, falling back to KNOWN_SERIES.
+        Uses GET /series?status=active&limit=200.
+        """
+        try:
+            data = await self._get("/series", params={"status": "active", "limit": 200})
+            tickers = [s["ticker"] for s in data.get("series", []) if s.get("ticker")]
+            if tickers:
+                logger.info(f"Discovered {len(tickers)} Kalshi series from API")
+                return tickers
+        except Exception as e:
+            logger.warning(f"Series discovery failed, using hardcoded list: {e}")
+        return list(self.KNOWN_SERIES)
+
     async def list_all_markets(
         self,
         status: str = "open",
@@ -226,15 +241,17 @@ class KalshiClient:
         on_progress: callable = None,
     ) -> list[KalshiMarket]:
         """
-        Fetch all simple binary markets by known series tickers.
+        Fetch all simple binary markets by series tickers.
 
+        Dynamically discovers series from the API; falls back to KNOWN_SERIES.
         The default paginated endpoint returns 15,000+ multi-leg sports
         markets before any simple binary markets appear, so we fetch by
         series instead.
         """
+        series_list = await self._discover_series()
         all_markets = []
 
-        for series in self.KNOWN_SERIES:
+        for series in series_list:
             markets, _ = await self.list_markets(
                 status=status,
                 series_ticker=series,
