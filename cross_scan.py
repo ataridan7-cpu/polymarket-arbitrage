@@ -14,6 +14,7 @@ from difflib import SequenceMatcher
 from utils.kelly import kelly_contracts
 from utils.predictit import get_predictit_markets, predictit_fee
 from utils.manifold import get_manifold_markets
+from utils.smarkets import get_smarkets_markets, smarkets_fee
 
 GAMMA_URL  = "https://gamma-api.polymarket.com"
 CLOB_URL   = "https://clob.polymarket.com"
@@ -421,15 +422,17 @@ async def main():
     print()
     print("  PLATFORM FEE COMPARISON")
     print("  ─────────────────────────────────────────────────────────────────")
-    print("  Platform    Fee model                     At 10¢   At 50¢   At 90¢")
-    print("  ──────────  ────────────────────────────  ───────  ───────  ───────")
-    print("  Polymarket  1.5% flat taker on entry      1.50%    1.50%    1.50%")
-    print("  Kalshi      7%×p×(1−p) per contract       0.63%    1.75%    0.63%  ← cheapest at tails")
-    print("  PredictIt   10% of profit on winning leg  90.0%    5.00%    1.11%  ← very expensive <80¢")
-    print("  Manifold    0%  (play money — mana)       —        —        —      ← signal only")
+    print("  Platform    Fee model                     At 10¢   At 50¢   At 90¢  US access")
+    print("  ──────────  ────────────────────────────  ───────  ───────  ───────  ─────────")
+    print("  Polymarket  1.5% flat taker on entry      1.50%    1.50%    1.50%   ✓ full")
+    print("  Kalshi      7%×p×(1−p) per contract       0.63%    1.75%    0.63%   ✓ full     ← cheapest at tails")
+    print("  PredictIt   10% of profit on winning leg  90.0%    5.00%    1.11%   ✓ ($850 cap)")
+    print("  Smarkets    2% of net winnings            1.80%    1.00%    0.20%   ✗ UK only  ← cheapest at 90¢+")
+    print("  Manifold    0% (play money — mana)        —        —        —       ✓ signal")
     print()
-    print("  Rule of thumb:  p < 31¢ or p > 69¢  →  Kalshi cheapest")
-    print("                  31¢ ≤ p ≤ 69¢         →  Polymarket cheapest")
+    print("  Rule of thumb:  p < 31¢ or p > 69¢  →  Kalshi cheapest (US)")
+    print("                  31¢ ≤ p ≤ 69¢         →  Polymarket cheapest (US)")
+    print("                  Smarkets is cheapest overall but requires UK access")
     print("                  PredictIt only worth trading at p > 90¢ (fee ≈ 1%)")
     print("  ─────────────────────────────────────────────────────────────────")
     print()
@@ -958,11 +961,133 @@ async def main():
     else:
         print("  No Manifold matches found.\n")
 
+    # ── Smarkets cross-scan ───────────────────────────────────────────────────
+    print("\n" + "=" * 72)
+    print("  Cross-Platform Scanner: Polymarket  ↔  Smarkets  —  live prices")
+    print("=" * 72)
+    print("  NOTE: Smarkets is a UK exchange. US trading requires VPN/UK account.")
+    print("  Fee: 2% of net winnings (cheaper than Poly at p>69¢, PredictIt always).")
+    print()
+    print("[SM] Fetching Smarkets US politics markets…")
+    sm_markets = await asyncio.get_event_loop().run_in_executor(
+        None, get_smarkets_markets
+    )
+    print(f"     {len(sm_markets)} Smarkets binary markets with prices")
+
+    sm_pairs = []
+    for pm in poly_liquid:
+        pq = pm.get("question") or ""
+        if not pq:
+            continue
+        pq_cat = category(pq)
+        if pq_cat not in ACTIVE_CATEGORIES:
+            continue
+        pm_mid = poly_gamma_mid(pm)
+        best_score, best_sm = 0.0, None
+        for sm in sm_markets:
+            st = sm.get("question") or ""
+            if not st or category(st) != pq_cat:
+                continue
+            if pm_mid is not None and sm.get("mid") is not None:
+                if abs(pm_mid - sm["mid"]) > 0.30:
+                    continue
+            s = similarity(pq, st) + entity_boost(pq, st) - discriminator_penalty(pq, st)
+            s = min(s, 1.0)
+            if s > best_score:
+                best_score, best_sm = s, sm
+        if best_score >= SIM_THRESH and best_sm:
+            sm_pairs.append((best_score, pm, best_sm))
+
+    sm_pairs.sort(key=lambda x: -x[0])
+    print(f"     {len(sm_pairs)} Smarkets matches above {SIM_THRESH:.0%} similarity")
+
+    sm_arbs = []
+    for score, pm, sm in sm_pairs[:20]:
+        tok_raw = pm.get("clobTokenIds", "")
+        ob, _ = await get_poly_ob(client, tok_raw)
+        if not ob:
+            continue
+
+        ya   = sm.get("yes_ask")
+        na   = sm.get("no_ask")
+        slug = pm.get("slug") or pm.get("market_slug") or ""
+        poly_url = f"https://polymarket.com/event/{slug}" if slug else ""
+        sm_url   = sm.get("url", "")
+
+        # Case G: Buy Poly YES + Smarkets NO
+        if ob["yes_ask"] and na:
+            cost  = ob["yes_ask"] + na
+            fp    = round(ob["yes_ask"] * POLY_FEE, 5)
+            fsm   = round(smarkets_fee(na), 5)
+            fees  = fp + fsm
+            gross = round(1.0 - cost, 4)
+            net   = round(gross - fees, 4)
+            if net >= MIN_EDGE:
+                sm_arbs.append({
+                    "type":      "Bundle: Buy Poly YES + Smarkets NO",
+                    "net_edge":  net, "gross_edge": gross, "fees": fees,
+                    "buy_price": cost, "similarity": score,
+                    "vol24h":    float(pm.get("volume24hr") or 0),
+                    "poly_q":    pm.get("question") or "",
+                    "sm_q":      sm.get("question") or "",
+                    "leg1":      f"Buy YES on Polymarket @ ${ob['yes_ask']:.3f}  (fee: ${fp:.4f})",
+                    "leg2":      f"Buy NO  on Smarkets   @ ${na:.3f}  (fee: ${fsm:.4f})",
+                    "poly_url":  poly_url, "sm_url": sm_url,
+                })
+
+        # Case H: Buy Smarkets YES + Poly NO
+        if ya and ob["no_ask"]:
+            cost  = ya + ob["no_ask"]
+            fp    = round(ob["no_ask"] * POLY_FEE, 5)
+            fsm   = round(smarkets_fee(ya), 5)
+            fees  = fp + fsm
+            gross = round(1.0 - cost, 4)
+            net   = round(gross - fees, 4)
+            if net >= MIN_EDGE:
+                sm_arbs.append({
+                    "type":      "Bundle: Buy Smarkets YES + Poly NO",
+                    "net_edge":  net, "gross_edge": gross, "fees": fees,
+                    "buy_price": cost, "similarity": score,
+                    "vol24h":    float(pm.get("volume24hr") or 0),
+                    "poly_q":    pm.get("question") or "",
+                    "sm_q":      sm.get("question") or "",
+                    "leg1":      f"Buy YES on Smarkets   @ ${ya:.3f}  (fee: ${fsm:.4f})",
+                    "leg2":      f"Buy NO  on Polymarket @ ${ob['no_ask']:.3f}  (fee: ${fp:.4f})",
+                    "poly_url":  poly_url, "sm_url": sm_url,
+                })
+
+        await asyncio.sleep(0.03)
+
+    sm_arbs.sort(key=lambda x: -x["net_edge"])
+    print()
+    if sm_arbs:
+        print("╔══════════════════════════════════════════════════════════════════════╗")
+        print("║  POLY ↔ SMARKETS BUNDLE ARB                                         ║")
+        print("╚══════════════════════════════════════════════════════════════════════╝")
+        for a in sm_arbs[:10]:
+            contracts, dollar_size = kelly_contracts(0.5, a["buy_price"], DEMO_BANKROLL)
+            exp_profit = contracts * a["net_edge"]
+            print(f"  ┌─ {a['type']}")
+            print(f"  │  Cost ${a['buy_price']:.3f}  Gross ${a['gross_edge']:.3f}  Fees ${a['fees']:.4f}  Net ${a['net_edge']:.3f} ({a['net_edge']*100:+.2f}%)")
+            print(f"  │  Match: {a['similarity']:.2f}   Vol24h: ${a['vol24h']:,.0f}")
+            print(f"  │  Poly:     {a['poly_q'][:65]}")
+            print(f"  │  Smarkets: {a['sm_q'][:65]}")
+            print(f"  │  LEG 1 — {a['leg1']}")
+            print(f"  │  LEG 2 — {a['leg2']}")
+            print(f"  │  Polymarket: {a['poly_url']}")
+            print(f"  │  Smarkets:   {a['sm_url']}")
+            print(f"  │  Kelly size: {contracts} contracts (~${dollar_size:.0f})  Expected profit: ~${exp_profit:.2f}")
+            print(f"  └─ ⚠  Smarkets requires UK account — verify access before trading")
+            print()
+    else:
+        print("  ✗ No Poly ↔ Smarkets arb found.\n")
+
     print("=" * 72)
     print(f"  SUMMARY STATS")
-    print(f"  Polymarket: {len(poly_liquid)} liquid markets   Kalshi: {len(kalshi)}   PredictIt: {len(pi_markets)}   Manifold: {len(mf_markets)}")
+    print(f"  Polymarket: {len(poly_liquid)}   Kalshi: {len(kalshi)}   PredictIt: {len(pi_markets)}   Manifold: {len(mf_markets)}   Smarkets: {len(sm_markets)}")
     print(f"  Kalshi pairs: {len(price_diffs)}   Genuine Kalshi arbs: {len(genuine_arbs)}")
     print(f"  PredictIt pairs: {len(pi_pairs)}   Genuine PredictIt arbs: {len(pi_arbs)}")
+    print(f"  Smarkets pairs: {len(sm_pairs)}   Genuine Smarkets arbs: {len(sm_arbs)}")
     print(f"  Manifold signal pairs: {len(mf_pairs)}")
     print("=" * 72)
 
