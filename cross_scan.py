@@ -297,43 +297,6 @@ async def main():
             diff = abs(pm_mid - km_mid)
             price_diffs.append((score, pm, km, ob, pm_mid, km_mid, diff))
 
-            # Cross-platform arb: buy cheap, sell expensive
-            # Case A: Polymarket YES is cheaper → buy on Poly, sell on Kalshi
-            if ob["yes_ask"] and km_mid:
-                gross = km_mid - ob["yes_ask"]
-                fees  = ob["yes_ask"] * POLY_FEE + km_mid * KALSHI_FEE
-                net   = gross - fees
-                if net >= MIN_EDGE:
-                    arbs.append({
-                        "type": "Buy Poly YES, Sell Kalshi YES",
-                        "net_edge": net,
-                        "gross_edge": gross,
-                        "buy_price": ob["yes_ask"],
-                        "sell_price": km_mid,
-                        "poly_q": (pm.get("question") or "")[:80],
-                        "kalshi_t": (km.get("title") or "")[:80],
-                        "similarity": score,
-                        "vol24h": float(pm.get("volume24hr") or 0),
-                    })
-
-            # Case B: Kalshi YES is cheaper → buy on Kalshi, sell on Poly
-            if ob["yes_bid"] and km_mid:
-                gross = ob["yes_bid"] - km_mid
-                fees  = km_mid * KALSHI_FEE + ob["yes_bid"] * POLY_FEE
-                net   = gross - fees
-                if net >= MIN_EDGE:
-                    arbs.append({
-                        "type": "Buy Kalshi YES, Sell Poly YES",
-                        "net_edge": net,
-                        "gross_edge": gross,
-                        "buy_price": km_mid,
-                        "sell_price": ob["yes_bid"],
-                        "poly_q": (pm.get("question") or "")[:80],
-                        "kalshi_t": (km.get("title") or "")[:80],
-                        "similarity": score,
-                        "vol24h": float(pm.get("volume24hr") or 0),
-                    })
-
             # Cross-platform bundle arb: buy YES on one side + NO on the other.
             # One leg always pays $1 at resolution regardless of outcome.
             km_yes_ask = float(km.get("yes_ask_dollars") or 0)
@@ -396,7 +359,7 @@ async def main():
     if genuine_arbs:
         genuine_arbs.sort(key=lambda x: -x["net_edge"])
         print("╔══════════════════════════════════════════════════════════════════════╗")
-        print("║  CROSS-PLATFORM ARB SIGNALS  (directional + bundle cross-platform)  ║")
+        print("║  CROSS-PLATFORM BUNDLE ARB  (YES one platform + NO the other)       ║")
         print("╚══════════════════════════════════════════════════════════════════════╝")
         for a in genuine_arbs[:10]:
             is_bundle = a["type"].startswith("Bundle")
