@@ -198,11 +198,22 @@ async def main():
         print("╔══════════════════════════════════════════════════════════════════════╗")
         print("║  BUNDLE BUY ARB  —  buy YES + NO together for < $1.00              ║")
         print("╚══════════════════════════════════════════════════════════════════════╝")
+        print()
+        print("  HOW TO EXECUTE: Buy both YES and NO shares on Polymarket for the")
+        print("  same market. Total cost < $1.00; one side always pays $1 at resolution.")
+        print("  Use limit orders at the shown ask prices. Start with ≤ 50 contracts")
+        print("  to test execution; scale if both legs fill cleanly.")
+        print()
         for r in buy_arbs[:10]:
             cost = r["yes"].best_ask + r["no"].best_ask
+            suggested = max(10, min(200, int(r["vol24h"] * 0.01)))
+            contracts = int(suggested / cost)
+            url = f"https://polymarket.com/event/{r['slug']}" if r["slug"] else "(no slug)"
             print(f"  Edge: {r['edge_buy']*100:+.2f}%   Cost: ${cost:.4f}   Vol24h: ${r['vol24h']:,.0f}")
-            print(f"  YES ask: {r['yes'].best_ask:.4f}   NO ask: {r['no'].best_ask:.4f}")
+            print(f"  Buy YES @ {r['yes'].best_ask:.4f}  +  Buy NO @ {r['no'].best_ask:.4f}  →  collect $1.00")
+            print(f"  Suggested: {contracts} contracts  (~${contracts*cost:.0f} cost, ~${contracts*r['edge_buy']:.2f} profit)")
             print(f"  {r['question']}")
+            print(f"  {url}")
             print()
     else:
         print("  ✗ No bundle BUY arb found in contested markets\n")
@@ -216,11 +227,19 @@ async def main():
         print("╔══════════════════════════════════════════════════════════════════════╗")
         print("║  BUNDLE SELL ARB  —  sell YES + NO together for > $1.00            ║")
         print("╚══════════════════════════════════════════════════════════════════════╝")
+        print()
+        print("  HOW TO EXECUTE: Sell both YES and NO shares on Polymarket (or sell")
+        print("  existing holdings). Revenue > $1.00 now; you owe $1.00 at resolution.")
+        print("  NOTE: Requires you to already hold the shares, or to short them.")
+        print("  Polymarket does not support naked shorting — you must own the contracts.")
+        print()
         for r in sell_arbs[:10]:
             rev = r["yes"].best_bid + r["no"].best_bid
+            url = f"https://polymarket.com/event/{r['slug']}" if r["slug"] else "(no slug)"
             print(f"  Edge: {r['edge_sell']*100:+.2f}%   Revenue: ${rev:.4f}   Vol24h: ${r['vol24h']:,.0f}")
-            print(f"  YES bid: {r['yes'].best_bid:.4f}   NO bid: {r['no'].best_bid:.4f}")
+            print(f"  Sell YES @ {r['yes'].best_bid:.4f}  +  Sell NO @ {r['no'].best_bid:.4f}")
             print(f"  {r['question']}")
+            print(f"  {url}")
             print()
     else:
         print("  ✗ No bundle SELL arb found\n")

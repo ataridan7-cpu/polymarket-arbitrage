@@ -302,23 +302,40 @@ async def main():
             km_yes_ask = float(km.get("yes_ask_dollars") or 0)
             km_no_ask  = float(km.get("no_ask_dollars")  or 0)
 
+            poly_slug    = pm.get("slug") or pm.get("market_slug") or ""
+            kalshi_tick  = km.get("ticker") or ""
+            kalshi_event = km.get("event_ticker") or kalshi_tick
+            close_time   = km.get("close_time") or ""
+            vol24h       = float(pm.get("volume24hr") or 0)
+
+            def _arb_base():
+                return {
+                    "poly_q":       (pm.get("question") or "")[:80],
+                    "kalshi_t":     (km.get("title") or "")[:80],
+                    "similarity":   score,
+                    "vol24h":       vol24h,
+                    "sell_price":   1.0,
+                    "poly_url":     f"https://polymarket.com/event/{poly_slug}" if poly_slug else "",
+                    "kalshi_url":   f"https://kalshi.com/markets/{kalshi_event}" if kalshi_event else "",
+                    "close_time":   close_time[:10] if close_time else "",  # YYYY-MM-DD
+                }
+
             # Case C: Buy Poly YES + Buy Kalshi NO → collect $1 either way
             if ob["yes_ask"] and km_no_ask:
                 cost  = ob["yes_ask"] + km_no_ask
                 fees  = ob["yes_ask"] * POLY_FEE + km_no_ask * KALSHI_FEE
                 net   = 1.0 - cost - fees
                 if net >= MIN_EDGE:
-                    arbs.append({
-                        "type": "Bundle: Buy Poly YES + Kalshi NO",
-                        "net_edge": net,
+                    a = _arb_base()
+                    a.update({
+                        "type":       "Bundle: Buy Poly YES + Kalshi NO",
+                        "net_edge":   net,
                         "gross_edge": 1.0 - cost,
-                        "buy_price": cost,
-                        "sell_price": 1.0,
-                        "poly_q": (pm.get("question") or "")[:80],
-                        "kalshi_t": (km.get("title") or "")[:80],
-                        "similarity": score,
-                        "vol24h": float(pm.get("volume24hr") or 0),
+                        "buy_price":  cost,
+                        "leg1":       f"Buy YES on Polymarket  @ ${ob['yes_ask']:.3f}",
+                        "leg2":       f"Buy NO  on Kalshi      @ ${km_no_ask:.3f}",
                     })
+                    arbs.append(a)
 
             # Case D: Buy Kalshi YES + Buy Poly NO → collect $1 either way
             if km_yes_ask and ob["no_ask"]:
@@ -326,17 +343,16 @@ async def main():
                 fees  = km_yes_ask * KALSHI_FEE + ob["no_ask"] * POLY_FEE
                 net   = 1.0 - cost - fees
                 if net >= MIN_EDGE:
-                    arbs.append({
-                        "type": "Bundle: Buy Kalshi YES + Poly NO",
-                        "net_edge": net,
+                    a = _arb_base()
+                    a.update({
+                        "type":       "Bundle: Buy Kalshi YES + Poly NO",
+                        "net_edge":   net,
                         "gross_edge": 1.0 - cost,
-                        "buy_price": cost,
-                        "sell_price": 1.0,
-                        "poly_q": (pm.get("question") or "")[:80],
-                        "kalshi_t": (km.get("title") or "")[:80],
-                        "similarity": score,
-                        "vol24h": float(pm.get("volume24hr") or 0),
+                        "buy_price":  cost,
+                        "leg1":       f"Buy YES on Kalshi      @ ${km_yes_ask:.3f}",
+                        "leg2":       f"Buy NO  on Polymarket  @ ${ob['no_ask']:.3f}",
                     })
+                    arbs.append(a)
 
             if (i + 1) % 10 == 0:
                 print(f"      {i+1}/{len(top_pairs)} checked  |  arb signals so far: {len(arbs)}", end="\r")
@@ -361,18 +377,47 @@ async def main():
         print("╔══════════════════════════════════════════════════════════════════════╗")
         print("║  CROSS-PLATFORM BUNDLE ARB  (YES one platform + NO the other)       ║")
         print("╚══════════════════════════════════════════════════════════════════════╝")
+        print()
+        print("  HOW TO EXECUTE A BUNDLE ARB TRADE")
+        print("  ──────────────────────────────────")
+        print("  1. Open both platform URLs below simultaneously.")
+        print("  2. Place BOTH legs as close to simultaneously as possible;")
+        print("     stale prices vanish fast — use limit orders at the shown ask.")
+        print("  3. Each $1 contract pays $1 at resolution, regardless of outcome.")
+        print("  4. Your profit = $1.00 − total cost − fees (shown as Net edge).")
+        print("  5. Position sizing: start small (≤ $100/signal) until you have")
+        print("     confirmed that both markets resolve on the same event/date.")
+        print("     Scale up to 1–2% of daily volume only after first verification.")
+        print("  6. Max position per leg is limited by the top-of-book liquidity;")
+        print("     do not move the market — use limit orders, not market orders.")
+        print("  7. RISK: If the two questions resolve differently (e.g., different")
+        print("     thresholds or dates), you hold an unhedged directional position.")
+        print("     Always read both question texts before trading.")
+        print()
         for a in genuine_arbs[:10]:
-            is_bundle = a["type"].startswith("Bundle")
-            if is_bundle:
-                price_str = f"Total cost: ${a['buy_price']:.3f}  →  collect $1.00"
-            else:
-                price_str = f"Buy: ${a['buy_price']:.3f}   Sell: ${a['sell_price']:.3f}"
-            print(f"  {a['type']}")
-            print(f"  Net edge: {a['net_edge']*100:+.2f}%   {price_str}")
-            print(f"  Match score: {a['similarity']:.2f}   Vol24h: ${a['vol24h']:,.0f}")
-            print(f"  Poly:  {a['poly_q']}")
-            print(f"  Kalshi:{a['kalshi_t']}")
-            print(f"  ⚠  Verify resolution criteria match before trading")
+            # Suggested size: 1% of 24h volume, capped at $200, floored at $10
+            suggested = max(10.0, min(200.0, a["vol24h"] * 0.01))
+            contracts = int(suggested / a["buy_price"])
+            exp_profit = contracts * a["net_edge"]
+            print(f"  ┌─ {a['type']}")
+            print(f"  │  Net edge: {a['net_edge']*100:+.2f}%   Total cost: ${a['buy_price']:.3f}  →  collect $1.00")
+            print(f"  │  Gross edge: ${a['gross_edge']:.3f}   Match score: {a['similarity']:.2f}   Vol24h: ${a['vol24h']:,.0f}")
+            if a.get("close_time"):
+                print(f"  │  Resolves: {a['close_time']}")
+            print(f"  │")
+            print(f"  │  Poly:  {a['poly_q']}")
+            print(f"  │  Kalshi:{a['kalshi_t']}")
+            print(f"  │")
+            print(f"  │  LEG 1 — {a['leg1']}")
+            print(f"  │  LEG 2 — {a['leg2']}")
+            if a.get("poly_url"):
+                print(f"  │  Polymarket: {a['poly_url']}")
+            if a.get("kalshi_url"):
+                print(f"  │  Kalshi:     {a['kalshi_url']}")
+            print(f"  │")
+            print(f"  │  Suggested size: {contracts} contracts (~${contracts * a['buy_price']:.0f} total cost)")
+            print(f"  │  Expected profit at suggested size: ~${exp_profit:.2f}")
+            print(f"  └─ ⚠  Verify both questions resolve on the same event before trading")
             print()
     else:
         print("  ✗ No cross-platform arb found.\n")
@@ -392,9 +437,15 @@ async def main():
         for score, pm, km, ob, pm_mid, km_mid, diff in price_diffs:
             if category(pm.get("question","")) == category(km.get("title","")):
                 direction = "Poly higher" if pm_mid > km_mid else "Kalshi higher"
+                slug        = pm.get("slug") or pm.get("market_slug") or ""
+                k_event     = km.get("event_ticker") or km.get("ticker") or ""
+                poly_url    = f"https://polymarket.com/event/{slug}" if slug else "(no slug)"
+                kalshi_url  = f"https://kalshi.com/markets/{k_event}" if k_event else "(no ticker)"
                 print(f"  Similarity: {score:.2f}  Gap: {diff*100:.1f}¢ ({direction})")
                 print(f"  Poly   [{pm_mid:.3f}]: {(pm.get('question') or '')[:70]}")
                 print(f"  Kalshi [{km_mid:.3f}]: {(km.get('title') or '')[:70]}")
+                print(f"  Links: {poly_url}")
+                print(f"         {kalshi_url}")
                 print()
                 shown += 1
                 if shown >= 10:
