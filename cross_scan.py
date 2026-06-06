@@ -18,7 +18,7 @@ KALSHI_URL = "https://api.elections.kalshi.com/trade-api/v2"
 POLY_FEE   = 0.015    # 1.5% taker fee
 KALSHI_FEE = 0.01     # ~1% taker fee
 MIN_EDGE   = 0.02     # 2% minimum net edge to signal
-SIM_THRESH = 0.50     # minimum text similarity to consider a match
+SIM_THRESH = 0.72     # minimum text similarity to consider a match
 POLY_N     = 500      # number of Polymarket markets to fetch
 
 
@@ -42,21 +42,36 @@ async def get_poly_markets(client, n=POLY_N):
     return markets[:n]
 
 
+KALSHI_SERIES = [
+    "KXBTC","KXETH","KXFED","KXCPI","KXPCE","KXGDP",
+    "KXNQ","KXSP500","KXGOLD","KXOIL",
+    "KXELONMARS","KXNEWPOPE","KXTRUMP",
+    "KXHIGHNY","KXHIGHLA","KXRAIN",
+]
+
 async def get_kalshi_markets(client):
-    markets, cursor = [], None
-    while True:
-        params = {"status": "open", "limit": 1000}
-        if cursor:
-            params["cursor"] = cursor
-        r = await client.get(f"{KALSHI_URL}/markets", params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        batch = data.get("markets", [])
-        if not batch: break
-        markets.extend(batch)
-        cursor = data.get("cursor")
-        if not cursor: break
-        await asyncio.sleep(0.15)
+    """
+    Fetch simple binary Kalshi markets by known series tickers.
+    Avoids paginating through 15,000+ multi-leg sports markets.
+    """
+    markets = []
+    for series in KALSHI_SERIES:
+        for attempt in range(3):
+            try:
+                r = await client.get(f"{KALSHI_URL}/markets",
+                                     params={"status": "open", "limit": 100,
+                                             "series_ticker": series},
+                                     timeout=15)
+                if r.status_code == 429:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                r.raise_for_status()
+                batch = r.json().get("markets", [])
+                markets.extend(m for m in batch if not m.get("mve_collection_ticker"))
+                break
+            except Exception:
+                await asyncio.sleep(2 ** attempt)
+        await asyncio.sleep(0.4)   # be polite between series
     return markets
 
 
@@ -88,9 +103,26 @@ def poly_mid(ob):
     return ba or bb
 
 
+# Kalshi market titles that are price-bracket or time-specific snapshots —
+# structurally incompatible with Polymarket's threshold questions.
+_KALSHI_INCOMPATIBLE = [
+    "price range",      # narrow bracket e.g. "Bitcoin price range on Jun 6"
+    "price at ",        # point-in-time snapshot e.g. "Ethereum price at Jun 6 at 4am"
+    "high temp",        # weather bracket
+    "temperature",
+]
+
 def kalshi_yes_mid(m):
-    p = m.get("yes_price", 0) or 0
-    return p / 100.0 if p > 0 else None
+    if m.get("mve_collection_ticker"):   # skip multi-leg sports markets
+        return None
+    title = (m.get("title") or "").lower()
+    if any(pat in title for pat in _KALSHI_INCOMPATIBLE):
+        return None                       # skip structurally incompatible markets
+    ya = float(m.get("yes_ask_dollars") or 0)
+    yb = float(m.get("yes_bid_dollars") or 0)
+    if ya and yb:
+        return (ya + yb) / 2
+    return ya or yb or None
 
 
 def normalize(text):
@@ -107,8 +139,34 @@ def similarity(t1, t2):
     return SequenceMatcher(None, n1, n2).ratio()
 
 
+def category(text: str) -> str:
+    """Assign a broad category so we only compare like-for-like markets."""
+    t = text.lower()
+    if any(k in t for k in ["cpi","inflation","consumer price"]):
+        return "cpi"
+    if any(k in t for k in ["federal funds","fed rate","interest rate","fomc","basis point","bps"]):
+        return "fed"
+    if any(k in t for k in ["gdp","gross domestic"]):
+        return "gdp"
+    if any(k in t for k in ["bitcoin","btc"]):
+        return "btc"
+    if any(k in t for k in ["ethereum","eth"]):
+        return "eth"
+    if any(k in t for k in ["trump","harris","biden","president","election","senate","congress"]):
+        return "politics"
+    if any(k in t for k in ["elon","musk","spacex","tesla"]):
+        # Distinguish elon tweet-count markets from elon event markets
+        if any(k in t for k in ["tweet","post","x.com","twitter"]):
+            return "elon_tweets"
+        return "elon_events"
+    return "other"
+
+
 def entity_boost(t1, t2):
     import re
+    # Must be same category or no boost
+    if category(t1) != category(t2):
+        return -0.5   # heavy penalty for cross-category matches
     # Crypto keywords
     crypto = ["bitcoin","btc","ethereum","eth","solana","sol","xrp","doge"]
     c1 = {c for c in crypto if c in t1.lower()}
@@ -119,10 +177,10 @@ def entity_boost(t1, t2):
     p1 = {p for p in pols if p in t1.lower()}
     p2 = {p for p in pols if p in t2.lower()}
     if p1 & p2: return 0.20
-    # Numbers / thresholds in both
-    nums1 = set(re.findall(r'\d{3,}', t1))
-    nums2 = set(re.findall(r'\d{3,}', t2))
-    if nums1 & nums2: return 0.10
+    # Numbers / thresholds shared between both titles
+    nums1 = set(re.findall(r'\d+(?:\.\d+)?%?', t1))
+    nums2 = set(re.findall(r'\d+(?:\.\d+)?%?', t2))
+    if nums1 & nums2: return 0.15
     return 0.0
 
 
@@ -149,17 +207,41 @@ async def main():
         kalshi = [m for m in kalshi_raw if kalshi_yes_mid(m) is not None]
         print(f"      {len(kalshi)} Kalshi markets with prices")
 
+        # Pre-compute Kalshi mids for price-proximity filter
+        kalshi_mids = {id(km): kalshi_yes_mid(km) for km in kalshi}
+
+        # Also grab Polymarket mid-prices cheaply from outcomePrices in Gamma data
+        def poly_gamma_mid(pm):
+            try:
+                import json as _json
+                prices = _json.loads(pm.get("outcomePrices") or "[]")
+                if prices:
+                    return float(prices[0])
+            except Exception:
+                pass
+            return None
+
         print(f"\n[3/4] Matching markets by title similarity…")
         pairs = []
         for pm in poly_liquid:
             pq = pm.get("question") or ""
             if not pq:
                 continue
+            pm_gamma_mid = poly_gamma_mid(pm)
+
             best_score, best_km = 0.0, None
             for km in kalshi:
                 kt = km.get("title") or ""
                 if not kt:
                     continue
+
+                # Price-proximity guard: skip if prices differ by more than 30¢
+                # This eliminates false matches between differently-structured questions
+                km_mid = kalshi_mids.get(id(km))
+                if pm_gamma_mid is not None and km_mid is not None:
+                    if abs(pm_gamma_mid - km_mid) > 0.30:
+                        continue
+
                 s = similarity(pq, kt) + entity_boost(pq, kt)
                 s = min(s, 1.0)
                 if s > best_score:
@@ -238,35 +320,59 @@ async def main():
     # ── results ────────────────────────────────────────────────────────────────
     print(f"\n{'='*72}")
 
-    if arbs:
-        arbs.sort(key=lambda x: -x["net_edge"])
+    # Only show arb signals where the price gap is ALSO confirmed by order books
+    # AND the category genuinely matches
+    genuine_arbs = [
+        a for a in arbs
+        if a["similarity"] >= SIM_THRESH
+        and category(a["poly_q"]) == category(a["kalshi_t"])
+        and category(a["poly_q"]) != "other"
+    ]
+
+    if genuine_arbs:
+        genuine_arbs.sort(key=lambda x: -x["net_edge"])
         print("╔══════════════════════════════════════════════════════════════════════╗")
-        print("║  CROSS-PLATFORM ARB SIGNALS                                         ║")
+        print("║  CROSS-PLATFORM ARB SIGNALS  (same category, same-direction price)  ║")
         print("╚══════════════════════════════════════════════════════════════════════╝")
-        for a in arbs[:10]:
+        for a in genuine_arbs[:10]:
             print(f"  {a['type']}")
             print(f"  Net edge: {a['net_edge']*100:+.2f}%   Buy: ${a['buy_price']:.3f}   Sell: ${a['sell_price']:.3f}")
             print(f"  Match score: {a['similarity']:.2f}   Vol24h: ${a['vol24h']:,.0f}")
             print(f"  Poly:  {a['poly_q']}")
             print(f"  Kalshi:{a['kalshi_t']}")
+            print(f"  ⚠  Verify resolution criteria match before trading")
             print()
     else:
-        print("  ✗ No cross-platform arb above 2% net edge found\n")
+        print("  ✗ No cross-platform arb found.\n")
+        print("  Note: Polymarket and Kalshi currently share very few equivalent")
+        print("  markets. Polymarket's volume is in crypto/sports price brackets;")
+        print("  Kalshi's simple binary markets cover CPI, GDP, Fed rate, and weather.")
+        print("  Genuine cross-platform arb requires both platforms asking the exact")
+        print("  same YES/NO question — which is rare today.\n")
 
-    # Show biggest price gaps (informational, even without clean arb)
-    print("╔══════════════════════════════════════════════════════════════════════╗")
-    print("║  LARGEST PRICE GAPS (Polymarket vs Kalshi mid-prices)              ║")
-    print("╚══════════════════════════════════════════════════════════════════════╝")
-    price_diffs.sort(key=lambda x: -x[6])
-    for score, pm, km, ob, pm_mid, km_mid, diff in price_diffs[:15]:
-        direction = "Poly higher" if pm_mid > km_mid else "Kalshi higher"
-        print(f"  Gap: {diff*100:.1f}¢  ({direction})  match: {score:.2f}  Vol24h: ${float(pm.get('volume24hr') or 0):,.0f}")
-        print(f"  Poly  mid: {pm_mid:.3f}  |  {(pm.get('question') or '')[:65]}")
-        print(f"  Kalshi mid: {km_mid:.3f}  |  {(km.get('title') or '')[:65]}")
-        print()
+    # Show closest candidate pairs for manual review
+    if price_diffs:
+        price_diffs.sort(key=lambda x: -x[0])   # sort by similarity score
+        print("╔══════════════════════════════════════════════════════════════════════╗")
+        print("║  CLOSEST MARKET MATCHES  (for manual review)                        ║")
+        print("╚══════════════════════════════════════════════════════════════════════╝")
+        shown = 0
+        for score, pm, km, ob, pm_mid, km_mid, diff in price_diffs:
+            if category(pm.get("question","")) == category(km.get("title","")):
+                direction = "Poly higher" if pm_mid > km_mid else "Kalshi higher"
+                print(f"  Similarity: {score:.2f}  Gap: {diff*100:.1f}¢ ({direction})")
+                print(f"  Poly   [{pm_mid:.3f}]: {(pm.get('question') or '')[:70]}")
+                print(f"  Kalshi [{km_mid:.3f}]: {(km.get('title') or '')[:70]}")
+                print()
+                shown += 1
+                if shown >= 10:
+                    break
+        if shown == 0:
+            print("  No same-category pairs found in top matches.\n")
 
     print("=" * 72)
-    print(f"Checked {len(price_diffs)} matched pairs   Cross-platform arb signals: {len(arbs)}")
+    print(f"Kalshi markets scanned: {len(kalshi)}   Poly markets scanned: {len(poly_liquid)}")
+    print(f"Same-category pairs checked: {len(price_diffs)}   Genuine arb signals: {len(genuine_arbs)}")
     print("=" * 72)
 
 

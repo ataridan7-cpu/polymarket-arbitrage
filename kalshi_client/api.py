@@ -209,53 +209,48 @@ class KalshiClient:
         next_cursor = data.get("cursor")
         return markets, next_cursor
     
+    # Known series tickers for simple binary markets.
+    # The default paginated endpoint returns 15k+ multi-leg sports bundles first,
+    # making series-based fetching the only practical approach.
+    KNOWN_SERIES = [
+        "KXBTC","KXETH","KXFED","KXCPI","KXPCE","KXGDP",
+        "KXNQ","KXSP500","KXGOLD","KXOIL",
+        "KXELONMARS","KXNEWPOPE","KXTRUMP",
+        "KXHIGHNY","KXHIGHLA","KXRAIN",
+    ]
+
     async def list_all_markets(
         self,
         status: str = "open",
-        max_markets: int = 10000,
-        on_progress: callable = None,  # Callback for progress updates
+        max_markets: int = 500,
+        on_progress: callable = None,
     ) -> list[KalshiMarket]:
         """
-        Fetch all markets with pagination.
-        
-        Args:
-            status: Market status filter
-            max_markets: Maximum total markets to fetch
-            on_progress: Optional callback(loaded_count) for progress updates
-            
-        Returns:
-            List of all markets
+        Fetch all simple binary markets by known series tickers.
+
+        The default paginated endpoint returns 15,000+ multi-leg sports
+        markets before any simple binary markets appear, so we fetch by
+        series instead.
         """
         all_markets = []
-        cursor = None
-        
-        while len(all_markets) < max_markets:
-            markets, next_cursor = await self.list_markets(
+
+        for series in self.KNOWN_SERIES:
+            markets, _ = await self.list_markets(
                 status=status,
-                limit=1000,
-                cursor=cursor,
+                series_ticker=series,
+                limit=100,
             )
-            
-            if not markets:
-                break
-            
             all_markets.extend(markets)
-            logger.info(f"Kalshi: {len(all_markets)} markets loaded...")
-            
-            # Report progress
+            logger.info(f"Kalshi [{series}]: {len(markets)} markets")
+
             if on_progress:
                 try:
                     on_progress(len(all_markets))
-                except:
+                except Exception:
                     pass
-            
-            if not next_cursor:
-                break
-            cursor = next_cursor
-            
-            # Small delay to avoid rate limiting
-            await asyncio.sleep(0.2)
-        
+
+            await asyncio.sleep(0.05)
+
         logger.info(f"Kalshi: {len(all_markets)} total markets loaded ✓")
         return all_markets[:max_markets]
     
@@ -285,12 +280,22 @@ class KalshiClient:
     def _parse_market(self, data: dict) -> Optional[KalshiMarket]:
         """Parse market data from API response."""
         try:
-            # Prices come in cents, convert to dollars
-            yes_price = data.get("yes_price", 0) / 100.0 if data.get("yes_price") else 0.0
-            no_price = data.get("no_price", 0) / 100.0 if data.get("no_price") else 0.0
-            
-            # If no_price not given, derive from yes_price
-            if no_price == 0 and yes_price > 0:
+            # Skip multi-leg sports markets — they're not comparable to Polymarket
+            if data.get("mve_collection_ticker"):
+                return None
+
+            # Prices are dollar strings e.g. "0.47" (yes_ask_dollars / yes_bid_dollars)
+            yes_ask = float(data.get("yes_ask_dollars") or 0)
+            yes_bid = float(data.get("yes_bid_dollars") or 0)
+            no_ask  = float(data.get("no_ask_dollars")  or 0)
+            no_bid  = float(data.get("no_bid_dollars")  or 0)
+
+            # Derive mid-prices
+            yes_price = (yes_ask + yes_bid) / 2 if yes_ask and yes_bid else (yes_ask or yes_bid)
+            no_price  = (no_ask  + no_bid)  / 2 if no_ask  and no_bid  else (no_ask  or no_bid)
+
+            # Fallback: derive no_price from yes_price if missing
+            if not no_price and yes_price:
                 no_price = 1.0 - yes_price
             
             # Parse close time
