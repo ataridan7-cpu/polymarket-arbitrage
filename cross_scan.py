@@ -26,6 +26,11 @@ SIM_THRESH  = 0.72    # minimum text similarity to consider a match
 POLY_N      = 500     # number of Polymarket markets to fetch
 DEMO_BANKROLL = 1000.0  # paper-trading bankroll for Kelly sizing
 
+# Only scan these two niches — the only categories with meaningful cross-platform
+# overlap after testing. Everything else (crypto brackets, elon, weather, CPI)
+# is structurally incompatible or covered on only one platform.
+ACTIVE_CATEGORIES = {"politics", "fed"}
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -255,11 +260,12 @@ def similarity(t1, t2):
 def discriminator_penalty(t1, t2):
     """Penalise pairs whose distinctive tokens point at different subjects.
 
-    If each title contains a significant word the other lacks (e.g. a specific
-    candidate name like 'eric' vs 'family'/'member'), they are not the same
-    market even when the surrounding template matches. Numbers are ignored here
-    because shared/different thresholds are handled by entity_boost.
+    Fed markets are exempt: Kalshi frames questions as absolute rate levels
+    ("above 5.25%") while Polymarket uses rate-change direction ("cut 25bps").
+    The vocabulary divergence is structural, not a sign of different events.
     """
+    if category(t1) == "fed" and category(t2) == "fed":
+        return 0.0
     a, b = content_tokens(t1), content_tokens(t2)
     only1 = {w for w in a - b if w.isalpha() and len(w) >= 4}
     only2 = {w for w in b - a if w.isalpha() and len(w) >= 4}
@@ -271,7 +277,9 @@ def category(text: str) -> str:
     t = text.lower()
     if any(k in t for k in ["cpi","inflation","consumer price"]):
         return "cpi"
-    if any(k in t for k in ["federal funds","fed rate","interest rate","fomc","basis point","bps"]):
+    if any(k in t for k in ["federal funds","fed rate","interest rate","fomc",
+                              "basis point","bps","rate cut","rate hike",
+                              "monetary policy","rate decision"]):
         return "fed"
     if any(k in t for k in ["gdp","gross domestic"]):
         return "gdp"
@@ -279,36 +287,123 @@ def category(text: str) -> str:
         return "btc"
     if any(k in t for k in ["ethereum","eth"]):
         return "eth"
-    if any(k in t for k in ["trump","harris","biden","president","election","senate","congress"]):
+    if any(k in t for k in ["trump","harris","biden","president","election",
+                              "senate","congress","governor","mayor","mayoral",
+                              "referendum","primary","gubernatorial","ballot",
+                              "representative","assembly","midterm","runoff"]):
         return "politics"
     if any(k in t for k in ["elon","musk","spacex","tesla"]):
-        # Distinguish elon tweet-count markets from elon event markets
         if any(k in t for k in ["tweet","post","x.com","twitter"]):
             return "elon_tweets"
         return "elon_events"
     return "other"
 
 
+import re as _re
+
+# FOMC meeting month abbreviations for normalisation
+_FOMC_MONTHS = {
+    "january":"jan","february":"feb","march":"mar","april":"apr",
+    "may":"may","june":"jun","july":"jul","august":"aug",
+    "september":"sep","october":"oct","november":"nov","december":"dec",
+    "jan":"jan","feb":"feb","mar":"mar","apr":"apr",
+    "jun":"jun","jul":"jul","aug":"aug","sep":"sep",
+    "oct":"oct","nov":"nov","dec":"dec",
+}
+
+def extract_fomc_key(text: str):
+    """Return 'mon<year>' (e.g. 'jun2026') if an FOMC meeting date is found.
+
+    Handles both "June 2026" and "Jun 17, 2026" (Kalshi's day-included format).
+    """
+    t = text.lower()
+    for name, abbr in _FOMC_MONTHS.items():
+        # Optional day number between month and year: "Jun 17, 2026" or "June 2026"
+        m = _re.search(rf'\b{name}\w*[\s,\-]+(?:\d{{1,2}}[,\s]+)?(\d{{4}})\b', t)
+        if m:
+            return f"{abbr}{m.group(1)}"
+    return None
+
+
+def fed_month_boost(t1: str, t2: str) -> float:
+    """
+    +0.35 when both Fed questions reference the same FOMC meeting month+year.
+
+    This bridges the vocabulary gap between Kalshi's absolute-level framing
+    ("above 5.25% following the June 2026 meeting") and Polymarket's direction
+    framing ("cut 25bps after the June 2026 meeting"). Same meeting = same event.
+    """
+    k1 = extract_fomc_key(t1)
+    k2 = extract_fomc_key(t2)
+    if k1 and k2 and k1 == k2:
+        return 0.35
+    return 0.0
+
+
+# US state names used for politics entity matching
+_US_STATES = {
+    "alabama","alaska","arizona","arkansas","california","colorado",
+    "connecticut","delaware","florida","georgia","hawaii","idaho",
+    "illinois","indiana","iowa","kansas","kentucky","louisiana","maine",
+    "maryland","massachusetts","michigan","minnesota","mississippi",
+    "missouri","montana","nebraska","nevada","hampshire","jersey",
+    "mexico","york","carolina","dakota","ohio","oklahoma","oregon",
+    "pennsylvania","rhode","tennessee","texas","utah","vermont",
+    "virginia","washington","wisconsin","wyoming",
+}
+
+# Expanded US political figure list
+_POLITICIANS = [
+    "trump","harris","biden","obama","clinton","sanders","warren",
+    "desantis","newsom","abbott","pence","rubio","cruz","paul",
+    "mcconnell","pelosi","schumer","ocasio","cortez","gaetz","jordan",
+    "boebert","greene","manchin","sinema","warnock","ossoff",
+    "fetterman","oz","hochul","whitmer","pritzker","shapiro",
+    "youngkin","kemp","stitt","kelly","cortez masto","hassan",
+]
+
+
 def entity_boost(t1, t2):
-    import re
-    # Must be same category or no boost
+    # Must be same category or heavy penalty
     if category(t1) != category(t2):
-        return -0.5   # heavy penalty for cross-category matches
-    # Crypto keywords
+        return -0.5
+
+    cat = category(t1)
+
+    if cat == "fed":
+        # For Fed: shared year number (same meeting cycle) gives a small boost;
+        # the big lift comes from fed_month_boost applied separately in scoring.
+        nums1 = set(_re.findall(r'\d{4}', t1))
+        nums2 = set(_re.findall(r'\d{4}', t2))
+        return 0.10 if nums1 & nums2 else 0.0
+
+    if cat == "politics":
+        l1, l2 = t1.lower(), t2.lower()
+        # Shared politician name → strong signal same subject
+        pols_shared = {p for p in _POLITICIANS if p in l1 and p in l2}
+        if pols_shared:
+            return 0.25
+        # Shared US state name → same race geography
+        states_shared = {s for s in _US_STATES if s in l1 and s in l2}
+        if states_shared:
+            return 0.20
+        # Shared election year
+        years1 = set(_re.findall(r'20\d{2}', t1))
+        years2 = set(_re.findall(r'20\d{2}', t2))
+        if years1 & years2:
+            return 0.15
+        return 0.0
+
+    # Crypto (kept for completeness even if not in ACTIVE_CATEGORIES)
     crypto = ["bitcoin","btc","ethereum","eth","solana","sol","xrp","doge"]
     c1 = {c for c in crypto if c in t1.lower()}
     c2 = {c for c in crypto if c in t2.lower()}
-    if c1 & c2: return 0.25
-    # Political names
-    pols = ["trump","harris","biden","elon","musk"]
-    p1 = {p for p in pols if p in t1.lower()}
-    p2 = {p for p in pols if p in t2.lower()}
-    if p1 & p2: return 0.20
-    # Numbers / thresholds shared between both titles
-    nums1 = set(re.findall(r'\d+(?:\.\d+)?%?', t1))
-    nums2 = set(re.findall(r'\d+(?:\.\d+)?%?', t2))
-    if nums1 & nums2: return 0.15
-    return 0.0
+    if c1 & c2:
+        return 0.25
+
+    nums1 = set(_re.findall(r'\d+(?:\.\d+)?%?', t1))
+    nums2 = set(_re.findall(r'\d+(?:\.\d+)?%?', t2))
+    return 0.15 if nums1 & nums2 else 0.0
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -358,6 +453,8 @@ async def main():
 
             best_score, best_km = 0.0, None
             pq_cat = category(pq)
+            if pq_cat not in ACTIVE_CATEGORIES:
+                continue
             for km in kalshi:
                 kt = km.get("title") or ""
                 if not kt:
@@ -367,15 +464,32 @@ async def main():
                 if pq_cat == "other" or category(kt) != pq_cat:
                     continue
 
-                # Price-proximity guard: skip if prices differ by more than 30¢
-                # This eliminates false matches between differently-structured questions
+                # Price-proximity guard: skip if prices differ by more than 30¢.
+                # Disabled for fed pairs: Kalshi asks about absolute rate levels while
+                # Polymarket asks about rate-change direction, so prices legitimately
+                # differ by ~20¢ on the same event (complementary structure).
                 km_mid = kalshi_mids.get(id(km))
-                if pm_gamma_mid is not None and km_mid is not None:
+                if pq_cat != "fed" and pm_gamma_mid is not None and km_mid is not None:
                     if abs(pm_gamma_mid - km_mid) > 0.30:
                         continue
 
-                s = similarity(pq, kt) + entity_boost(pq, kt) - discriminator_penalty(pq, kt)
-                s = min(s, 1.0)
+                if pq_cat == "fed":
+                    # Fed pairs: FOMC meeting date is the primary match key.
+                    # Vocabulary is incompatible (absolute level vs direction),
+                    # so similarity scoring alone will never reach threshold.
+                    fomc_pm = extract_fomc_key(pq)
+                    fomc_km = extract_fomc_key(kt)
+                    if fomc_pm and fomc_km:
+                        if fomc_pm != fomc_km:
+                            continue  # Different meetings — skip
+                        # Same meeting: guaranteed same event, force above threshold
+                        s = min(0.76 + entity_boost(pq, kt), 1.0)
+                    else:
+                        # No meeting date extractable — fall back to similarity
+                        s = min(similarity(pq, kt) + entity_boost(pq, kt) + fed_month_boost(pq, kt), 1.0)
+                else:
+                    s = similarity(pq, kt) + entity_boost(pq, kt) - discriminator_penalty(pq, kt)
+                    s = min(s, 1.0)
                 if s > best_score:
                     best_score = s
                     best_km = km
@@ -408,6 +522,14 @@ async def main():
 
             # Cross-platform bundle arb: buy YES on one side + NO on the other.
             # One leg always pays $1 at resolution regardless of outcome.
+            # NOTE: Fed pairs are excluded from bundle arb because Kalshi asks about
+            # absolute rate levels ("above 5.25%") while Polymarket asks about rate
+            # change direction ("cut 25bps") — they are NOT complementary binaries and
+            # a "no change" scenario could make both legs lose.
+            pq_cat_arb = category(pm.get("question") or "")
+            if pq_cat_arb == "fed":
+                continue
+
             km_yes_ask = float(km.get("yes_ask_dollars") or 0)
             km_no_ask  = float(km.get("no_ask_dollars")  or 0)
 
@@ -618,7 +740,7 @@ async def main():
         if not pq:
             continue
         pq_cat = category(pq)
-        if pq_cat == "other":
+        if pq_cat not in ACTIVE_CATEGORIES:
             continue
         pm_mid = poly_gamma_mid(pm)
         best_score, best_pi = 0.0, None
@@ -626,11 +748,22 @@ async def main():
             pt = pi.get("question") or ""
             if category(pt) != pq_cat:
                 continue
-            if pm_mid is not None and pi.get("mid") is not None:
+            # Same price-guard exemption for fed: complementary question structures
+            if pq_cat != "fed" and pm_mid is not None and pi.get("mid") is not None:
                 if abs(pm_mid - pi["mid"]) > 0.30:
                     continue
-            s = similarity(pq, pt) + entity_boost(pq, pt) - discriminator_penalty(pq, pt)
-            s = min(s, 1.0)
+            if pq_cat == "fed":
+                fomc_pm = extract_fomc_key(pq)
+                fomc_pt = extract_fomc_key(pt)
+                if fomc_pm and fomc_pt:
+                    if fomc_pm != fomc_pt:
+                        continue
+                    s = min(0.76 + entity_boost(pq, pt), 1.0)
+                else:
+                    s = min(similarity(pq, pt) + entity_boost(pq, pt) + fed_month_boost(pq, pt), 1.0)
+            else:
+                s = similarity(pq, pt) + entity_boost(pq, pt) - discriminator_penalty(pq, pt)
+                s = min(s, 1.0)
             if s > best_score:
                 best_score, best_pi = s, pi
         if best_score >= SIM_THRESH and best_pi:
