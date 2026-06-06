@@ -322,35 +322,47 @@ async def main():
 
             # Case C: Buy Poly YES + Buy Kalshi NO → collect $1 either way
             if ob["yes_ask"] and km_no_ask:
-                cost  = ob["yes_ask"] + km_no_ask
-                fees  = ob["yes_ask"] * POLY_FEE + km_no_ask * KALSHI_FEE
-                net   = 1.0 - cost - fees
+                cost       = ob["yes_ask"] + km_no_ask
+                fee_poly   = round(ob["yes_ask"] * POLY_FEE, 5)
+                fee_kalshi = round(km_no_ask * KALSHI_FEE, 5)
+                fees       = fee_poly + fee_kalshi
+                gross      = round(1.0 - cost, 4)
+                net        = round(gross - fees, 4)
                 if net >= MIN_EDGE:
                     a = _arb_base()
                     a.update({
                         "type":       "Bundle: Buy Poly YES + Kalshi NO",
                         "net_edge":   net,
-                        "gross_edge": 1.0 - cost,
+                        "gross_edge": gross,
+                        "fees":       fees,
+                        "fee_poly":   fee_poly,
+                        "fee_kalshi": fee_kalshi,
                         "buy_price":  cost,
-                        "leg1":       f"Buy YES on Polymarket  @ ${ob['yes_ask']:.3f}",
-                        "leg2":       f"Buy NO  on Kalshi      @ ${km_no_ask:.3f}",
+                        "leg1":       f"Buy YES on Polymarket  @ ${ob['yes_ask']:.3f}  (fee: ${fee_poly:.4f})",
+                        "leg2":       f"Buy NO  on Kalshi      @ ${km_no_ask:.3f}  (fee: ${fee_kalshi:.4f})",
                     })
                     arbs.append(a)
 
             # Case D: Buy Kalshi YES + Buy Poly NO → collect $1 either way
             if km_yes_ask and ob["no_ask"]:
-                cost  = km_yes_ask + ob["no_ask"]
-                fees  = km_yes_ask * KALSHI_FEE + ob["no_ask"] * POLY_FEE
-                net   = 1.0 - cost - fees
+                cost       = km_yes_ask + ob["no_ask"]
+                fee_kalshi = round(km_yes_ask * KALSHI_FEE, 5)
+                fee_poly   = round(ob["no_ask"] * POLY_FEE, 5)
+                fees       = fee_kalshi + fee_poly
+                gross      = round(1.0 - cost, 4)
+                net        = round(gross - fees, 4)
                 if net >= MIN_EDGE:
                     a = _arb_base()
                     a.update({
                         "type":       "Bundle: Buy Kalshi YES + Poly NO",
                         "net_edge":   net,
-                        "gross_edge": 1.0 - cost,
+                        "gross_edge": gross,
+                        "fees":       fees,
+                        "fee_poly":   fee_poly,
+                        "fee_kalshi": fee_kalshi,
                         "buy_price":  cost,
-                        "leg1":       f"Buy YES on Kalshi      @ ${km_yes_ask:.3f}",
-                        "leg2":       f"Buy NO  on Polymarket  @ ${ob['no_ask']:.3f}",
+                        "leg1":       f"Buy YES on Kalshi      @ ${km_yes_ask:.3f}  (fee: ${fee_kalshi:.4f})",
+                        "leg2":       f"Buy NO  on Polymarket  @ ${ob['no_ask']:.3f}  (fee: ${fee_poly:.4f})",
                     })
                     arbs.append(a)
 
@@ -399,9 +411,13 @@ async def main():
             suggested = max(10.0, min(200.0, a["vol24h"] * 0.01))
             contracts = int(suggested / a["buy_price"])
             exp_profit = contracts * a["net_edge"]
+            fees      = a.get("fees", 0)
+            fee_poly  = a.get("fee_poly", 0)
+            fee_kalshi= a.get("fee_kalshi", 0)
             print(f"  ┌─ {a['type']}")
-            print(f"  │  Net edge: {a['net_edge']*100:+.2f}%   Total cost: ${a['buy_price']:.3f}  →  collect $1.00")
-            print(f"  │  Gross edge: ${a['gross_edge']:.3f}   Match score: {a['similarity']:.2f}   Vol24h: ${a['vol24h']:,.0f}")
+            print(f"  │  Cost: ${a['buy_price']:.3f}  →  Gross: ${a['gross_edge']:.3f}  −  Fees: ${fees:.4f}  =  Net: ${a['net_edge']:.3f} ({a['net_edge']*100:+.2f}%)")
+            print(f"  │  Fees: Poly ${fee_poly:.4f} ({POLY_FEE*100:.1f}%)  +  Kalshi ${fee_kalshi:.4f} ({KALSHI_FEE*100:.1f}%)")
+            print(f"  │  Match score: {a['similarity']:.2f}   Vol24h: ${a['vol24h']:,.0f}")
             if a.get("close_time"):
                 print(f"  │  Resolves: {a['close_time']}")
             print(f"  │")

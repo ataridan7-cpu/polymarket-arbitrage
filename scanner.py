@@ -124,18 +124,20 @@ async def scan_one(client: httpx.AsyncClient, m: dict) -> Optional[dict]:
         return None
 
     # Bundle BUY arb: pay (yes_ask + no_ask), collect $1 at resolution
-    edge_buy = None
+    edge_buy = fees_buy = gross_buy = None
     if yes.best_ask and no.best_ask:
         cost      = yes.best_ask + no.best_ask
-        fees      = cost * TAKER_FEE
-        edge_buy  = round(1.0 - cost - fees, 4)
+        fees_buy  = round(cost * TAKER_FEE, 5)
+        gross_buy = round(1.0 - cost, 4)
+        edge_buy  = round(gross_buy - fees_buy, 4)
 
     # Bundle SELL arb: collect (yes_bid + no_bid), owe $1 at resolution
-    edge_sell = None
+    edge_sell = fees_sell = gross_sell = None
     if yes.best_bid and no.best_bid:
-        revenue   = yes.best_bid + no.best_bid
-        fees      = revenue * TAKER_FEE
-        edge_sell = round(revenue - fees - 1.0, 4)
+        revenue    = yes.best_bid + no.best_bid
+        fees_sell  = round(revenue * TAKER_FEE, 5)
+        gross_sell = round(revenue - 1.0, 4)
+        edge_sell  = round(gross_sell - fees_sell, 4)
 
     slug = m.get("slug") or m.get("market_slug") or ""
     yes_bid_depth = top3_depth(yb_raw, "bids")
@@ -149,6 +151,10 @@ async def scan_one(client: httpx.AsyncClient, m: dict) -> Optional[dict]:
         "no":            no,
         "edge_buy":      edge_buy,
         "edge_sell":     edge_sell,
+        "fees_buy":      fees_buy,
+        "fees_sell":     fees_sell,
+        "gross_buy":     gross_buy,
+        "gross_sell":    gross_sell,
         "slug":          slug,
         "yes_bid_depth": yes_bid_depth,
         "yes_ask_depth": yes_ask_depth,
@@ -206,12 +212,16 @@ async def main():
         print()
         for r in buy_arbs[:10]:
             cost = r["yes"].best_ask + r["no"].best_ask
+            gross = r["gross_buy"] or 0
+            fees  = r["fees_buy"] or 0
+            net   = r["edge_buy"]
             suggested = max(10, min(200, int(r["vol24h"] * 0.01)))
-            contracts = int(suggested / cost)
+            contracts = max(1, int(suggested / cost))
             url = f"https://polymarket.com/event/{r['slug']}" if r["slug"] else "(no slug)"
-            print(f"  Edge: {r['edge_buy']*100:+.2f}%   Cost: ${cost:.4f}   Vol24h: ${r['vol24h']:,.0f}")
+            print(f"  Cost: ${cost:.4f}   Vol24h: ${r['vol24h']:,.0f}")
             print(f"  Buy YES @ {r['yes'].best_ask:.4f}  +  Buy NO @ {r['no'].best_ask:.4f}  →  collect $1.00")
-            print(f"  Suggested: {contracts} contracts  (~${contracts*cost:.0f} cost, ~${contracts*r['edge_buy']:.2f} profit)")
+            print(f"  Gross: ${gross:.4f}  −  Fees: ${fees:.4f} ({TAKER_FEE*100:.1f}% taker)  =  Net: ${net:.4f} ({net*100:+.2f}%)")
+            print(f"  Suggested: {contracts} contracts  (${contracts*cost:.0f} cost  →  ${contracts*net:.2f} net profit)")
             print(f"  {r['question']}")
             print(f"  {url}")
             print()
@@ -234,10 +244,14 @@ async def main():
         print("  Polymarket does not support naked shorting — you must own the contracts.")
         print()
         for r in sell_arbs[:10]:
-            rev = r["yes"].best_bid + r["no"].best_bid
+            rev   = r["yes"].best_bid + r["no"].best_bid
+            gross = r["gross_sell"] or 0
+            fees  = r["fees_sell"] or 0
+            net   = r["edge_sell"]
             url = f"https://polymarket.com/event/{r['slug']}" if r["slug"] else "(no slug)"
-            print(f"  Edge: {r['edge_sell']*100:+.2f}%   Revenue: ${rev:.4f}   Vol24h: ${r['vol24h']:,.0f}")
+            print(f"  Revenue: ${rev:.4f}   Vol24h: ${r['vol24h']:,.0f}")
             print(f"  Sell YES @ {r['yes'].best_bid:.4f}  +  Sell NO @ {r['no'].best_bid:.4f}")
+            print(f"  Gross: ${gross:.4f}  −  Fees: ${fees:.4f} ({TAKER_FEE*100:.1f}% taker)  =  Net: ${net:.4f} ({net*100:+.2f}%)")
             print(f"  {r['question']}")
             print(f"  {url}")
             print()
@@ -255,12 +269,22 @@ async def main():
     mm_marginal = [r for r in mm_all if max(r["yes"].spread or 0, r["no"].spread or 0) < 0.04]
 
     def print_mm_row(r):
-        ys = r["yes"].spread or 0
-        ns = r["no"].spread  or 0
+        ys  = r["yes"].spread or 0
+        ns  = r["no"].spread  or 0
+        mid = r["yes"].mid or 0
+        best_sp = max(ys, ns)
+        # As maker (limit order): 0% fee on entry.
+        # If forced to taker-exit one leg: pay TAKER_FEE × price.
+        taker_exit_cost = round(mid * TAKER_FEE * 100, 2)          # cents
+        net_sp_maker    = round(best_sp * 100, 2)                  # cents, maker-only
+        net_sp_taker    = round((best_sp - mid * TAKER_FEE) * 100, 2)  # one taker exit
+        breakeven       = round(mid * TAKER_FEE * 100, 2)          # cents
+        profitable      = "✓" if best_sp * 100 > breakeven else "✗"
         url = f"https://polymarket.com/event/{r['slug']}" if r["slug"] else "(no slug)"
         print(f"  YES spread: {ys*100:.1f}¢  (bid {r['yes'].best_bid or 0:.3f} / ask {r['yes'].best_ask or 0:.3f}  depth top-3: {r['yes_bid_depth']:.0f} / {r['yes_ask_depth']:.0f})")
         print(f"  NO  spread: {ns*100:.1f}¢  (bid {r['no'].best_bid  or 0:.3f} / ask {r['no'].best_ask  or 0:.3f})")
-        print(f"  Vol24h: ${r['vol24h']:,.0f}   mid YES: {r['yes'].mid:.3f}")
+        print(f"  Fee check {profitable}: maker entry=0¢  |  taker exit≈{taker_exit_cost}¢  |  net after exit: {net_sp_taker}¢  (breakeven > {breakeven}¢)")
+        print(f"  Vol24h: ${r['vol24h']:,.0f}   mid YES: {mid:.3f}")
         print(f"  {r['question']}")
         print(f"  {url}")
         print()
