@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""
+Cross-Platform Scanner: Polymarket vs Kalshi
+============================================
+Finds price gaps for the same prediction on both platforms.
+"""
+
+import asyncio
+import httpx
+import json
+import sys
+from difflib import SequenceMatcher
+
+GAMMA_URL  = "https://gamma-api.polymarket.com"
+CLOB_URL   = "https://clob.polymarket.com"
+KALSHI_URL = "https://api.elections.kalshi.com/trade-api/v2"
+
+POLY_FEE   = 0.015    # 1.5% taker fee
+KALSHI_FEE = 0.01     # ~1% taker fee
+MIN_EDGE   = 0.02     # 2% minimum net edge to signal
+SIM_THRESH = 0.50     # minimum text similarity to consider a match
+POLY_N     = 500      # number of Polymarket markets to fetch
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+async def get_poly_markets(client, n=POLY_N):
+    markets, offset = [], 0
+    while len(markets) < n:
+        r = await client.get(f"{GAMMA_URL}/markets", params={
+            "closed": "false", "active": "true",
+            "order": "volume24hr", "ascending": "false",
+            "limit": 100, "offset": offset,
+        }, timeout=20)
+        r.raise_for_status()
+        batch = r.json()
+        if not batch: break
+        markets.extend(batch)
+        if len(batch) < 100: break
+        offset += 100
+        await asyncio.sleep(0.08)
+    return markets[:n]
+
+
+async def get_kalshi_markets(client):
+    markets, cursor = [], None
+    while True:
+        params = {"status": "open", "limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+        r = await client.get(f"{KALSHI_URL}/markets", params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        batch = data.get("markets", [])
+        if not batch: break
+        markets.extend(batch)
+        cursor = data.get("cursor")
+        if not cursor: break
+        await asyncio.sleep(0.15)
+    return markets
+
+
+async def get_poly_ob(client, tok_raw):
+    try:
+        toks = json.loads(tok_raw)
+        yes_id, no_id = str(toks[0]), str(toks[1])
+    except Exception:
+        return None, None
+    try:
+        yr, nr = await asyncio.gather(
+            client.get(f"{CLOB_URL}/book", params={"token_id": yes_id}, timeout=8),
+            client.get(f"{CLOB_URL}/book", params={"token_id": no_id}, timeout=8),
+        )
+        yb, nb = yr.json(), nr.json()
+        def best_bid(b): return max((float(x["price"]) for x in b.get("bids",[])), default=None)
+        def best_ask(b): return min((float(x["price"]) for x in b.get("asks",[])), default=None)
+        return {
+            "yes_bid": best_bid(yb), "yes_ask": best_ask(yb),
+            "no_bid":  best_bid(nb), "no_ask":  best_ask(nb),
+        }, None
+    except Exception as e:
+        return None, str(e)
+
+
+def poly_mid(ob):
+    ba, bb = ob.get("yes_ask"), ob.get("yes_bid")
+    if ba and bb: return (ba + bb) / 2
+    return ba or bb
+
+
+def kalshi_yes_mid(m):
+    p = m.get("yes_price", 0) or 0
+    return p / 100.0 if p > 0 else None
+
+
+def normalize(text):
+    import re
+    text = text.lower()
+    text = re.sub(r'[^\w\s]', ' ', text)
+    stop = {"will","the","a","an","be","to","in","on","by","at","what","who","which","when",
+            "is","are","was","were","market","bet","odds","win","winner","prediction"}
+    return ' '.join(w for w in text.split() if w not in stop)
+
+
+def similarity(t1, t2):
+    n1, n2 = normalize(t1), normalize(t2)
+    return SequenceMatcher(None, n1, n2).ratio()
+
+
+def entity_boost(t1, t2):
+    import re
+    # Crypto keywords
+    crypto = ["bitcoin","btc","ethereum","eth","solana","sol","xrp","doge"]
+    c1 = {c for c in crypto if c in t1.lower()}
+    c2 = {c for c in crypto if c in t2.lower()}
+    if c1 & c2: return 0.25
+    # Political names
+    pols = ["trump","harris","biden","elon","musk"]
+    p1 = {p for p in pols if p in t1.lower()}
+    p2 = {p for p in pols if p in t2.lower()}
+    if p1 & p2: return 0.20
+    # Numbers / thresholds in both
+    nums1 = set(re.findall(r'\d{3,}', t1))
+    nums2 = set(re.findall(r'\d{3,}', t2))
+    if nums1 & nums2: return 0.10
+    return 0.0
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+async def main():
+    print("=" * 72)
+    print("  Cross-Platform Scanner: Polymarket  ↔  Kalshi  —  live prices")
+    print("=" * 72)
+
+    async with httpx.AsyncClient() as client:
+        print(f"\n[1/4] Fetching Polymarket top {POLY_N} markets…")
+        poly_raw = await get_poly_markets(client, POLY_N)
+        # keep only contested (YES mid 10%–90%) with some volume
+        poly_liquid = [
+            m for m in poly_raw
+            if float(m.get("volume24hr") or 0) >= 500
+        ]
+        print(f"      {len(poly_liquid)} markets with ≥ $500 daily volume")
+
+        print(f"\n[2/4] Fetching all Kalshi open markets…")
+        kalshi_raw = await get_kalshi_markets(client)
+        # only binary markets with a real YES price
+        kalshi = [m for m in kalshi_raw if kalshi_yes_mid(m) is not None]
+        print(f"      {len(kalshi)} Kalshi markets with prices")
+
+        print(f"\n[3/4] Matching markets by title similarity…")
+        pairs = []
+        for pm in poly_liquid:
+            pq = pm.get("question") or ""
+            if not pq:
+                continue
+            best_score, best_km = 0.0, None
+            for km in kalshi:
+                kt = km.get("title") or ""
+                if not kt:
+                    continue
+                s = similarity(pq, kt) + entity_boost(pq, kt)
+                s = min(s, 1.0)
+                if s > best_score:
+                    best_score = s
+                    best_km = km
+            if best_score >= SIM_THRESH and best_km:
+                pairs.append((best_score, pm, best_km))
+
+        pairs.sort(key=lambda x: -x[0])
+        print(f"      {len(pairs)} potential matches above {SIM_THRESH:.0%} similarity")
+
+        # Take top 60 highest-similarity pairs to check order books
+        top_pairs = pairs[:60]
+        print(f"\n[4/4] Fetching Polymarket order books for top {len(top_pairs)} pairs…")
+
+        arbs = []
+        price_diffs = []
+
+        for i, (score, pm, km) in enumerate(top_pairs):
+            tok_raw = pm.get("clobTokenIds", "")
+            ob, err = await get_poly_ob(client, tok_raw)
+            if not ob:
+                continue
+
+            pm_mid = poly_mid(ob)
+            km_mid = kalshi_yes_mid(km)
+            if pm_mid is None or km_mid is None:
+                continue
+
+            diff = abs(pm_mid - km_mid)
+            price_diffs.append((score, pm, km, ob, pm_mid, km_mid, diff))
+
+            # Cross-platform arb: buy cheap, sell expensive
+            # Case A: Polymarket YES is cheaper → buy on Poly, sell on Kalshi
+            if ob["yes_ask"] and km_mid:
+                gross = km_mid - ob["yes_ask"]
+                fees  = ob["yes_ask"] * POLY_FEE + km_mid * KALSHI_FEE
+                net   = gross - fees
+                if net >= MIN_EDGE:
+                    arbs.append({
+                        "type": "Buy Poly YES, Sell Kalshi YES",
+                        "net_edge": net,
+                        "gross_edge": gross,
+                        "buy_price": ob["yes_ask"],
+                        "sell_price": km_mid,
+                        "poly_q": (pm.get("question") or "")[:80],
+                        "kalshi_t": (km.get("title") or "")[:80],
+                        "similarity": score,
+                        "vol24h": float(pm.get("volume24hr") or 0),
+                    })
+
+            # Case B: Kalshi YES is cheaper → buy on Kalshi, sell on Poly
+            if ob["yes_bid"] and km_mid:
+                gross = ob["yes_bid"] - km_mid
+                fees  = km_mid * KALSHI_FEE + ob["yes_bid"] * POLY_FEE
+                net   = gross - fees
+                if net >= MIN_EDGE:
+                    arbs.append({
+                        "type": "Buy Kalshi YES, Sell Poly YES",
+                        "net_edge": net,
+                        "gross_edge": gross,
+                        "buy_price": km_mid,
+                        "sell_price": ob["yes_bid"],
+                        "poly_q": (pm.get("question") or "")[:80],
+                        "kalshi_t": (km.get("title") or "")[:80],
+                        "similarity": score,
+                        "vol24h": float(pm.get("volume24hr") or 0),
+                    })
+
+            if (i + 1) % 10 == 0:
+                print(f"      {i+1}/{len(top_pairs)} checked  |  arb signals so far: {len(arbs)}", end="\r")
+            await asyncio.sleep(0.05)
+
+        print()
+
+    # ── results ────────────────────────────────────────────────────────────────
+    print(f"\n{'='*72}")
+
+    if arbs:
+        arbs.sort(key=lambda x: -x["net_edge"])
+        print("╔══════════════════════════════════════════════════════════════════════╗")
+        print("║  CROSS-PLATFORM ARB SIGNALS                                         ║")
+        print("╚══════════════════════════════════════════════════════════════════════╝")
+        for a in arbs[:10]:
+            print(f"  {a['type']}")
+            print(f"  Net edge: {a['net_edge']*100:+.2f}%   Buy: ${a['buy_price']:.3f}   Sell: ${a['sell_price']:.3f}")
+            print(f"  Match score: {a['similarity']:.2f}   Vol24h: ${a['vol24h']:,.0f}")
+            print(f"  Poly:  {a['poly_q']}")
+            print(f"  Kalshi:{a['kalshi_t']}")
+            print()
+    else:
+        print("  ✗ No cross-platform arb above 2% net edge found\n")
+
+    # Show biggest price gaps (informational, even without clean arb)
+    print("╔══════════════════════════════════════════════════════════════════════╗")
+    print("║  LARGEST PRICE GAPS (Polymarket vs Kalshi mid-prices)              ║")
+    print("╚══════════════════════════════════════════════════════════════════════╝")
+    price_diffs.sort(key=lambda x: -x[6])
+    for score, pm, km, ob, pm_mid, km_mid, diff in price_diffs[:15]:
+        direction = "Poly higher" if pm_mid > km_mid else "Kalshi higher"
+        print(f"  Gap: {diff*100:.1f}¢  ({direction})  match: {score:.2f}  Vol24h: ${float(pm.get('volume24hr') or 0):,.0f}")
+        print(f"  Poly  mid: {pm_mid:.3f}  |  {(pm.get('question') or '')[:65]}")
+        print(f"  Kalshi mid: {km_mid:.3f}  |  {(km.get('title') or '')[:65]}")
+        print()
+
+    print("=" * 72)
+    print(f"Checked {len(price_diffs)} matched pairs   Cross-platform arb signals: {len(arbs)}")
+    print("=" * 72)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
