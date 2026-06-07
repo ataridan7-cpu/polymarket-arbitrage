@@ -15,6 +15,7 @@ from utils.kelly import kelly_contracts
 from utils.predictit import get_predictit_markets, predictit_fee
 from utils.manifold import get_manifold_markets
 from utils.smarkets import get_smarkets_markets, smarkets_fee
+from utils.betfair import get_betfair_markets, betfair_fee
 
 GAMMA_URL  = "https://gamma-api.polymarket.com"
 CLOB_URL   = "https://clob.polymarket.com"
@@ -421,20 +422,22 @@ async def main():
     print("=" * 72)
     print()
     print("  PLATFORM FEE COMPARISON")
-    print("  ─────────────────────────────────────────────────────────────────")
-    print("  Platform    Fee model                     At 10¢   At 50¢   At 90¢  US access")
-    print("  ──────────  ────────────────────────────  ───────  ───────  ───────  ─────────")
-    print("  Polymarket  1.5% flat taker on entry      1.50%    1.50%    1.50%   ✓ full")
-    print("  Kalshi      7%×p×(1−p) per contract       0.63%    1.75%    0.63%   ✓ full     ← cheapest at tails")
-    print("  PredictIt   10% of profit on winning leg  90.0%    5.00%    1.11%   ✓ ($850 cap)")
-    print("  Smarkets    2% of net winnings            1.80%    1.00%    0.20%   ✗ UK only  ← cheapest at 90¢+")
-    print("  Manifold    0% (play money — mana)        —        —        —       ✓ signal")
+    print("  ──────────────────────────────────────────────────────────────────────")
+    print("  Platform    Fee model                     At 10¢   At 50¢   At 90¢  Access")
+    print("  ──────────  ────────────────────────────  ───────  ───────  ───────  ──────")
+    print("  Polymarket  1.5% flat taker on entry      1.50%    1.50%    1.50%   Global (crypto)")
+    print("  Kalshi      7%×p×(1−p) per contract       0.63%    1.75%    0.63%   US only   ← cheapest US at tails")
+    print("  Betfair     5% of net winnings            4.50%    2.50%    0.50%   IL ✓ UK ✓ ← cheapest overall >75¢")
+    print("  Smarkets    2% of net winnings            1.80%    1.00%    0.20%   UK only   ← cheapest overall always")
+    print("  PredictIt   10% of profit on winning leg  90.0%    5.00%    1.11%   US only")
+    print("  Manifold    0% (play money — mana)        —        —        —       Global (signal)")
     print()
-    print("  Rule of thumb:  p < 31¢ or p > 69¢  →  Kalshi cheapest (US)")
-    print("                  31¢ ≤ p ≤ 69¢         →  Polymarket cheapest (US)")
-    print("                  Smarkets is cheapest overall but requires UK access")
-    print("                  PredictIt only worth trading at p > 90¢ (fee ≈ 1%)")
-    print("  ─────────────────────────────────────────────────────────────────")
+    print("  For Israeli traders:")
+    print("    Best fee for balanced markets (31-69¢): Betfair (2.5% at 50¢) < Polymarket (1.5%)")
+    print("    Wait — Polymarket's 1.5% beats Betfair's 2.5% at 50¢. Betfair wins only at p>75¢.")
+    print("    Polymarket (crypto, global) is your lowest-fee option for most markets.")
+    print("    Betfair (register at betfair.com, accepts IL) wins at p > 75¢ or p < 25¢.")
+    print("  ──────────────────────────────────────────────────────────────────────")
     print()
 
     async with httpx.AsyncClient() as client:
@@ -877,6 +880,127 @@ async def main():
     else:
         print("  ✗ No Poly ↔ PredictIt arb found.\n")
 
+    # ── Betfair cross-scan ────────────────────────────────────────────────────
+    print("\n" + "=" * 72)
+    print("  Cross-Platform Scanner: Polymarket  ↔  Betfair  —  live prices")
+    print("=" * 72)
+    print("  Betfair accepts Israeli accounts. Set BETFAIR_APP_KEY + credentials to enable.")
+    print("  Fee: 5% of net winnings (beats Polymarket at p > 75¢ or p < 25¢).")
+    print()
+    print("[BF] Fetching Betfair US politics markets…")
+    bf_markets = await asyncio.get_event_loop().run_in_executor(
+        None, get_betfair_markets
+    )
+    print(f"     {len(bf_markets)} Betfair binary markets with prices")
+
+    bf_pairs = []
+    for pm in poly_liquid:
+        pq = pm.get("question") or ""
+        if not pq:
+            continue
+        pq_cat = category(pq)
+        if pq_cat not in ACTIVE_CATEGORIES:
+            continue
+        pm_mid = poly_gamma_mid(pm)
+        best_score, best_bf = 0.0, None
+        for bf in bf_markets:
+            bt = bf.get("question") or ""
+            if not bt or category(bt) != pq_cat:
+                continue
+            if pm_mid is not None and bf.get("mid") is not None:
+                if abs(pm_mid - bf["mid"]) > 0.35:
+                    continue
+            s = similarity(pq, bt) + entity_boost(pq, bt) - discriminator_penalty(pq, bt)
+            s = min(s, 1.0)
+            if s > best_score:
+                best_score, best_bf = s, bf
+        if best_score >= SIM_THRESH and best_bf:
+            bf_pairs.append((best_score, pm, best_bf))
+
+    bf_pairs.sort(key=lambda x: -x[0])
+    print(f"     {len(bf_pairs)} Betfair matches above {SIM_THRESH:.0%} similarity")
+
+    bf_arbs = []
+    for score, pm, bf in bf_pairs[:20]:
+        tok_raw = pm.get("clobTokenIds", "")
+        ob, _ = await get_poly_ob(client, tok_raw)
+        if not ob:
+            continue
+
+        ya   = bf.get("yes_ask")
+        na   = bf.get("no_ask")
+        slug = pm.get("slug") or pm.get("market_slug") or ""
+        poly_url = f"https://polymarket.com/event/{slug}" if slug else ""
+        bf_url   = bf.get("url", "")
+
+        # Case I: Buy Poly YES + Betfair NO
+        if ob["yes_ask"] and na:
+            cost  = ob["yes_ask"] + na
+            fp    = round(ob["yes_ask"] * POLY_FEE, 5)
+            fbf   = round(betfair_fee(na), 5)
+            fees  = fp + fbf
+            gross = round(1.0 - cost, 4)
+            net   = round(gross - fees, 4)
+            if net >= MIN_EDGE:
+                bf_arbs.append({
+                    "type":      "Bundle: Buy Poly YES + Betfair NO",
+                    "net_edge":  net, "gross_edge": gross, "fees": fees,
+                    "buy_price": cost, "similarity": score,
+                    "vol24h":    float(pm.get("volume24hr") or 0),
+                    "poly_q":    pm.get("question") or "",
+                    "bf_q":      bf.get("question") or "",
+                    "leg1":      f"Buy YES on Polymarket @ ${ob['yes_ask']:.3f}  (fee: ${fp:.4f})",
+                    "leg2":      f"Buy NO  on Betfair    @ ${na:.3f}  (fee: ${fbf:.4f})",
+                    "poly_url":  poly_url, "bf_url": bf_url,
+                })
+
+        # Case J: Buy Betfair YES + Poly NO
+        if ya and ob["no_ask"]:
+            cost  = ya + ob["no_ask"]
+            fp    = round(ob["no_ask"] * POLY_FEE, 5)
+            fbf   = round(betfair_fee(ya), 5)
+            fees  = fp + fbf
+            gross = round(1.0 - cost, 4)
+            net   = round(gross - fees, 4)
+            if net >= MIN_EDGE:
+                bf_arbs.append({
+                    "type":      "Bundle: Buy Betfair YES + Poly NO",
+                    "net_edge":  net, "gross_edge": gross, "fees": fees,
+                    "buy_price": cost, "similarity": score,
+                    "vol24h":    float(pm.get("volume24hr") or 0),
+                    "poly_q":    pm.get("question") or "",
+                    "bf_q":      bf.get("question") or "",
+                    "leg1":      f"Buy YES on Betfair    @ ${ya:.3f}  (fee: ${fbf:.4f})",
+                    "leg2":      f"Buy NO  on Polymarket @ ${ob['no_ask']:.3f}  (fee: ${fp:.4f})",
+                    "poly_url":  poly_url, "bf_url": bf_url,
+                })
+
+        await asyncio.sleep(0.03)
+
+    bf_arbs.sort(key=lambda x: -x["net_edge"])
+    print()
+    if bf_arbs:
+        print("╔══════════════════════════════════════════════════════════════════════╗")
+        print("║  POLY ↔ BETFAIR BUNDLE ARB                                          ║")
+        print("╚══════════════════════════════════════════════════════════════════════╝")
+        for a in bf_arbs[:10]:
+            contracts, dollar_size = kelly_contracts(0.5, a["buy_price"], DEMO_BANKROLL)
+            exp_profit = contracts * a["net_edge"]
+            print(f"  ┌─ {a['type']}")
+            print(f"  │  Cost ${a['buy_price']:.3f}  Gross ${a['gross_edge']:.3f}  Fees ${a['fees']:.4f}  Net ${a['net_edge']:.3f} ({a['net_edge']*100:+.2f}%)")
+            print(f"  │  Match: {a['similarity']:.2f}   Vol24h: ${a['vol24h']:,.0f}")
+            print(f"  │  Poly:    {a['poly_q'][:65]}")
+            print(f"  │  Betfair: {a['bf_q'][:65]}")
+            print(f"  │  LEG 1 — {a['leg1']}")
+            print(f"  │  LEG 2 — {a['leg2']}")
+            print(f"  │  Polymarket: {a['poly_url']}")
+            print(f"  │  Betfair:    {a['bf_url']}")
+            print(f"  │  Kelly size: {contracts} contracts (~${dollar_size:.0f})  Expected: ~${exp_profit:.2f}")
+            print(f"  └─ ⚠  Verify questions resolve on the same event before trading")
+            print()
+    else:
+        print("  ✗ No Poly ↔ Betfair arb found.\n")
+
     # ── Manifold price-signal comparison ─────────────────────────────────────
     print("\n" + "=" * 72)
     print("  Price-Signal Comparison: Polymarket  ↔  Manifold  (play money)")
@@ -1084,10 +1208,11 @@ async def main():
 
     print("=" * 72)
     print(f"  SUMMARY STATS")
-    print(f"  Polymarket: {len(poly_liquid)}   Kalshi: {len(kalshi)}   PredictIt: {len(pi_markets)}   Manifold: {len(mf_markets)}   Smarkets: {len(sm_markets)}")
-    print(f"  Kalshi pairs: {len(price_diffs)}   Genuine Kalshi arbs: {len(genuine_arbs)}")
-    print(f"  PredictIt pairs: {len(pi_pairs)}   Genuine PredictIt arbs: {len(pi_arbs)}")
-    print(f"  Smarkets pairs: {len(sm_pairs)}   Genuine Smarkets arbs: {len(sm_arbs)}")
+    print(f"  Polymarket: {len(poly_liquid)}  Kalshi: {len(kalshi)}  PredictIt: {len(pi_markets)}  Betfair: {len(bf_markets)}  Smarkets: {len(sm_markets)}  Manifold: {len(mf_markets)}")
+    print(f"  Kalshi pairs: {len(price_diffs)}   arbs: {len(genuine_arbs)}")
+    print(f"  PredictIt pairs: {len(pi_pairs)}   arbs: {len(pi_arbs)}")
+    print(f"  Betfair pairs: {len(bf_pairs)}   arbs: {len(bf_arbs)}")
+    print(f"  Smarkets pairs: {len(sm_pairs)}   arbs: {len(sm_arbs)}")
     print(f"  Manifold signal pairs: {len(mf_pairs)}")
     print("=" * 72)
 
